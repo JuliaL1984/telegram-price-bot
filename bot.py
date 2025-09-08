@@ -4,6 +4,7 @@ from typing import Optional, List, Tuple, Dict, Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import Message, ContentType, InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -182,7 +183,11 @@ def clean_brands(text: str) -> str:
 
 # ---------- Telegram ----------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
+
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
+)
 dp = Dispatcher()
 
 @dp.message(Command("start"))
