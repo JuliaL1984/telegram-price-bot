@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import logging
 from typing import Dict, Optional, List
 
@@ -11,156 +12,187 @@ from aiogram.types import Message, ContentType
 # ----------------- НАСТРОЙКИ -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment")
+    raise RuntimeError("BOT_TOKEN is not set")
+
+# Куда публиковать результат: "@my_channel" или "-1001234567890".
+# Если пусто — отвечаем туда, где пришло сообщение.
+TARGET_CHAT = os.getenv("TARGET_CHAT", "").strip()
+
+# Временный режим: печатать chat_id на любое сообщение (0/1)
+ECHO_CHAT_ID = os.getenv("ECHO_CHAT_ID", "0") == "1"
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("price-bot")
+log = logging.getLogger("fashion-shop-bot")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Храним формулы по чатам (пока в памяти)
-FORMULAS: Dict[int, str] = {}  # chat_id -> formula string, напр. "-%+10%+30€"
+# Формулы по чатам (в памяти)
+FORMULAS: Dict[int, str] = {}
+DEFAULT_FORMULA = "-%"
+
+# Чтобы отвечать один раз на альбом (media group)
+PROCESSED_GROUPS = set()
 
 # ----------------- РЕГЭКСЫ -----------------
-# Цена и скидка. Ловим:
-#   5010-35% | 5010 - 35% | 5010€ -35% | Цена 5 010 € - 35 %
+# Цена/скидка: допускаем точку/запятую/пробел между € и минусом: "5200€.-35%"
 PRICE_PAT = re.compile(
-    r'(?:^|\n|\s)(?:цена[:\s]*)?'
-    r'(?P<price>\d[\d\s.,]*)\s*(?:€|eur|euro)?\s*[-–]?\s*(?P<disc>\d+(?:[.,]\d+)?)\s*%',
+    r'(?s)(?:^|\n|\s)(?:цена[:\s]*)?'
+    r'(?P<price>\d[\d\s.,]*)\s*(?:€|eur|euro)?'
+    r'\s*[,.\s]*[-–]?\s*(?P<disc>\d+(?:[.,]\d+)?)\s*%',
     re.IGNORECASE
 )
 
-# Размеры
-SIZES_PAT = re.compile(
-    r'размер(?:ы)?[:\s]+(?P<sizes>[A-Za-zА-Яа-я0-9/ ,.\-]+)',
-    re.IGNORECASE
-)
+# Размеры: "Размер S", "Размеры: 38/39/40"
+SIZES_PAT = re.compile(r'размер(?:ы)?[:\s]+(?P<sizes>[A-Za-zА-Яа-я0-9/ ,.\-]+)', re.IGNORECASE)
+
+# Хештеги вида #BottegaVeneta
+HASHTAG_PAT = re.compile(r'(^|\s)#\w+', re.UNICODE)
 
 BRAND_WORDS = [
     'gucci','prada','valentino','balenciaga','jimmy choo','bally','stone island',
     'chopard','hermès','hermes','dior','lv','louis vuitton','versace','celine',
     'burberry','miumiu','bottega veneta','loewe','ysl','saint laurent','fendi'
 ]
-BAN_WORDS = BRAND_WORDS + ['мужское','женское']
+BAN_WORDS = BRAND_WORDS + ['мужское','женское','в наличии в бутике']
+
+# Шаги формулы: +10%, -5€, и т.п.; спец-метка "-%" — применить скидку магазина
+STEP_PAT = re.compile(r'(?P<op>[+\-])\s*(?P<val>\d+(?:[.,]\d+)?)\s*(?P<unit>%|€)', re.IGNORECASE)
 
 # ----------------- УТИЛИТЫ -----------------
 def to_float(num_str: str) -> float:
-    """Превращаем '5 010,50' -> 5010.50"""
     s = num_str.replace('\u00A0','').replace(' ', '').replace(',', '.')
     return float(s)
 
 def fmt_eur(x: float) -> str:
-    return f"{x:.2f}€"
+    # Всегда округляем вверх
+    return f"{math.ceil(x)}€"
 
 def parse_post(text: str):
-    """Достаём цену, скидку, размеры и дополнительные строки."""
     m = PRICE_PAT.search(text)
     if not m:
         return None
 
     price = to_float(m.group('price'))
     disc = float(m.group('disc').replace(',', '.'))
-    final_after_sale = price * (1 - disc/100.0)
+    after_sale = price * (1 - disc/100.0)
 
+    # Явные размеры "Размер ..."
     sizes: Optional[str] = None
     ms = SIZES_PAT.search(text)
     if ms:
         sizes = ms.group('sizes').strip()
 
-    # Собираем полезные строки, исключая бренды/пол и строку с ценой/размерами
     extra: List[str] = []
+    fallback_sizes: List[str] = []
     for line in (ln.strip() for ln in text.splitlines() if ln.strip()):
         low = line.lower()
-        if PRICE_PAT.search(line):      # строка с ценой
+
+        # пропускаем строку с ценой
+        if PRICE_PAT.search(line):
             continue
-        if low.startswith('размер'):    # строка с размерами
-            continue
+
+        # убираем бренды/пол/наличие и ХЕШТЕГИ
         if any(w in low for w in BAN_WORDS):
             continue
+        if HASHTAG_PAT.search(low):
+            continue
+
+        # явные "Размер ..."
+        if low.startswith('размер'):
+            continue
+
+        # ФОЛЛБЭК РАЗМЕРОВ: "40. 42", "38 40 42", "S/M", "Xs"
+        if sizes is None and re.fullmatch(r'[A-Za-zА-Яа-я0-9/.\s]{1,20}', line) and any(ch.isdigit() or ch.isalpha() for ch in line):
+            cleaned = re.sub(r'[,\.\s]+', '/', line).strip('/ ')
+            if re.fullmatch(r'(?:[0-9]{1,2}|[XSMLxl]{1,3})(?:/(?:[0-9]{1,2}|[XSMLxl]{1,3}))*', cleaned, re.I):
+                fallback_sizes.append(cleaned.upper())
+                continue
+
+        # не цена/не размеры/не бренд/не хештег — оставляем
         extra.append(line)
+
+    if sizes is None and fallback_sizes:
+        uniq = []
+        for s in "/".join(fallback_sizes).split('/'):
+            u = s.strip().upper()
+            if u and u not in uniq:
+                uniq.append(u)
+        sizes = "/".join(uniq)
 
     return {
         "price": price,
         "discount": disc,
-        "after_sale": final_after_sale,
+        "after_sale": after_sale,
         "sizes": sizes,
         "extra": extra,
     }
 
-# ----------------- ФОРМУЛА -----------------
-# Формула — последовательность шагов:
-#   -%        -> применить скидку из поста
-#   +10%      -> прибавить 10 процентов
-#   +30€      -> прибавить 30 евро
-#   -5€       -> вычесть 5 евро
-STEP_PAT = re.compile(r'(?P<op>[+\-])\s*(?P<val>\d+(?:[.,]\d+)?)\s*(?P<unit>%|€)', re.IGNORECASE)
-
 def apply_formula(base_after_sale: float, discount_pct: float, formula: str) -> float:
-    """
-    Применяем формулу к цене **после скидки**.
-    Специальный шаг '-%' означает «применить скидку к исходной цене».
-    Логика:
-      1) Если в формуле есть '-%', то сначала считаем price*(1-disc/100),
-         иначе берём base_after_sale как уже готовую цену после скидки.
-      2) Затем последовательно применяем остальные шаги.
-    """
-    # Нормализуем
-    f = formula.replace(' ', '')
-    # Сначала проверим наличие '-%'
-    start_price = base_after_sale
-    if '-%' in f:
-        # Повторно применим скидку к исходной цене? Нет — base_after_sale уже содержит её.
-        # Поэтому убираем этот маркер только как "явно указали использовать скидку".
-        f = f.replace('-%', '')
-        # start_price уже равен base_after_sale
-    # Теперь остальное по порядку
-    price = start_price
+    # Формулу применяем к цене после скидки магазина
+    f = formula.replace(' ', '').replace('-%', '')
+    price = base_after_sale
     for m in STEP_PAT.finditer(f):
         op = m.group('op')
         val = float(m.group('val').replace(',', '.'))
         unit = m.group('unit')
         if unit == '%':
-            if op == '+':
-                price = price * (1 + val/100.0)
-            else:
-                price = price * (1 - val/100.0)
+            price = price * (1 + val/100.0) if op == '+' else price * (1 - val/100.0)
         else:  # €
-            if op == '+':
-                price = price + val
-            else:
-                price = price - val
+            price = price + val if op == '+' else price - val
     return price
 
 def get_formula(chat_id: int) -> str:
-    # Формула по умолчанию — просто "-%" (применить скидку магазина).
-    return FORMULAS.get(chat_id, "-%")
+    return FORMULAS.get(chat_id, DEFAULT_FORMULA)
 
-# ----------------- КОМАНДЫ -----------------
+# ---------- Выбор формулы по порогам ----------
+def choose_formula_for_price(after_sale_eur: float, user_formula: str) -> str:
+    """
+    Если цена после скидки (цена-%) ≤ 250 → -%+55€
+    Если 251–400 → -%+70€
+    Иначе → пользовательская /formula
+    """
+    if after_sale_eur <= 250:
+        return "-%+55€"
+    elif 251 <= after_sale_eur <= 400:
+        return "-%+70€"
+    else:
+        return user_formula
+
+# ----------------- СЛУЖЕБНОЕ: chat_id -----------------
+@dp.message(Command("chatid"))
+async def cmd_chatid(msg: Message):
+    await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>", parse_mode=ParseMode.HTML)
+    print("Chat ID:", msg.chat.id)
+
+if ECHO_CHAT_ID:
+    @dp.message()
+    async def echo_chat_id(msg: Message):
+        await msg.answer(f"Chat ID: <code>{msg.chat.id}</code>", parse_mode=ParseMode.HTML)
+        print("Chat ID:", msg.chat.id)
+
+# ----------------- КОМАНДЫ ПОЛЬЗОВАТЕЛЯ -----------------
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
     await msg.answer(
         "Бот онлайн.\n"
-        "• Установить формулу: <code>/formula -%+10%+30€</code>\n"
-        "• Затем отправляй пост вида:\n"
-        "  <code>5010-35%</code> (можно в подписи к фото)\n"
-        "  или <code>Цена 5010€ -35%</code>\n",
+        "1) Формула: <code>/formula -%+10%+30€</code>\n"
+        "2) Отправляй пост: <code>5010-35%</code> (можно в подписи к фото/альбому)\n"
+        "   или <code>Цена 5010€ -35%</code>.\n"
+        "Сервис: <code>/chatid</code> — показать ID этого чата.",
         parse_mode=ParseMode.HTML
     )
 
 @dp.message(Command("formula"))
 async def cmd_formula(msg: Message):
-    # Ожидаем "/formula <шаги>"
     parts = msg.text.split(maxsplit=1)
     if len(parts) == 1:
         return await msg.answer(
             "Использование: <code>/formula -%+10%+30€</code>\n"
-            "Допустимые шаги: <code>-%</code>, <code>+N%</code>, <code>-N%</code>, "
-            "<code>+N€</code>, <code>-N€</code>.",
+            "Шаги: <code>-%</code>, <code>+N%</code>, <code>-N%</code>, <code>+N€</code>, <code>-N€</code>.",
             parse_mode=ParseMode.HTML
         )
     formula = parts[1].strip()
-    # Лёгкая валидация
     if not ('%' in formula or '€' in formula):
         return await msg.answer("Формула должна содержать шаги с % или €.", parse_mode=ParseMode.HTML)
 
@@ -170,29 +202,47 @@ async def cmd_formula(msg: Message):
 # ----------------- ОСНОВНОЙ ХЕНДЛЕР -----------------
 @dp.message(F.content_type.in_({ContentType.TEXT, ContentType.PHOTO}))
 async def handle_price(msg: Message):
+    # Для альбомов: отвечаем один раз, на сообщение с подписью
+    if msg.media_group_id:
+        if msg.caption is None:
+            return
+        if msg.media_group_id in PROCESSED_GROUPS:
+            return
+        PROCESSED_GROUPS.add(msg.media_group_id)
+
     text = (msg.caption or msg.text or "").strip()
     if not text:
         return
 
     parsed = parse_post(text)
     if not parsed:
-        # Тихо игнорируем нерелевантные сообщения
-        return
+        return  # молчим на нерелевантные сообщения
 
-    # применяем формулу
-    formula = get_formula(msg.chat.id)
+    # Выбор формулы по порогу
+    user_formula = get_formula(msg.chat.id)
+    formula = choose_formula_for_price(parsed["after_sale"], user_formula)
+
+    # Итог
     final_price = apply_formula(parsed["after_sale"], parsed["discount"], formula)
 
-    # собираем ответ
+    # Сборка подписи: всё жирным; эмодзи в КОНЦЕ строк
     lines = [
-        f"✅ <b>{fmt_eur(final_price)}</b>",
-        f"❌ <b>Retail price {fmt_eur(parsed['price'])}</b>",
+        f"<b>{fmt_eur(final_price)} ✅</b>",
+        f"<b>Retail price {fmt_eur(parsed['price'])} ❌</b>",
     ]
     if parsed.get("sizes"):
-        lines.append(f"Размеры: {parsed['sizes']}")
-    lines += parsed.get("extra", [])
+        lines.append(f"<b>Размеры: {parsed['sizes']}</b>")
+    for line in parsed.get("extra", []):
+        lines.append(f"<b>{line}</b>")
+    caption = "\n".join(lines)
 
-    await msg.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    # Куда отправлять
+    target = TARGET_CHAT if TARGET_CHAT else msg.chat.id
+
+    if msg.content_type == ContentType.PHOTO:
+        await bot.send_photo(target, msg.photo[-1].file_id, caption=caption, parse_mode=ParseMode.HTML)
+    else:
+        await bot.send_message(target, caption, parse_mode=ParseMode.HTML)
 
 # ----------------- ЗАПУСК -----------------
 async def main():
