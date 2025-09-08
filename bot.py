@@ -1,15 +1,4 @@
-import os
-import re
-import math
-import logging
-from typing import Dict, Optional, List
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.types import Message, ContentType
-
-# ----------------- НАСТРОЙКИ -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
