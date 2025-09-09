@@ -1,22 +1,24 @@
 # bot.py
 import os
 import re
-import math
 import asyncio
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import List, Optional
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InputMediaPhoto
-# from aiogram.exceptions import RetryAfter   # ✗ удалено: в aiogram 3.7 этого класса нет
+from aiogram.types import Message
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 # === НАСТРОЙКИ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")   # берём токен из Render → Environment
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002973176038"))  # ID группы
 WAIT_TEXT_SECONDS = 8  # окно ожидания текста после фото
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 
 # Память для склейки "фото → подпись"
@@ -90,7 +92,7 @@ async def handle_text(msg: Message):
         # Сообщение с результатом
         await bot.send_message(TARGET_CHAT_ID, result)
 
-        # Отправляем фото с подписью (НЕ media_group, т.к. фото всего одно)
+        # Отправляем фото с подписью (одним фото — через send_photo)
         if last_media[chat_id]["file_ids"]:
             await bot.send_photo(
                 TARGET_CHAT_ID,
@@ -103,7 +105,6 @@ async def handle_text(msg: Message):
 
 # === ЗАПУСК ===
 async def main():
-    # Без RetryAfter: aiogram 3.7 его не отдаёт; Render сам перезапустит при падении
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
