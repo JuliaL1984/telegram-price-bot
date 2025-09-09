@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InputMediaPhoto
-from aiogram.utils.exceptions import RetryAfter
+from aiogram.exceptions import RetryAfter
 
 # === НАСТРОЙКИ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")   # берём токен из Render → Environment
