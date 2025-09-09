@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InputMediaPhoto
-from aiogram.exceptions import RetryAfter
+# from aiogram.exceptions import RetryAfter   # ✗ удалено: в aiogram 3.7 этого класса нет
 
 # === НАСТРОЙКИ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")   # берём токен из Render → Environment
@@ -22,11 +22,9 @@ dp = Dispatcher()
 # Память для склейки "фото → подпись"
 last_media: dict[int, dict] = {}
 
-
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 def round_price(value: float) -> int:
     return int(round(value, 0))
-
 
 def apply_formula(price: float, discount: int) -> int:
     """
@@ -43,7 +41,6 @@ def apply_formula(price: float, discount: int) -> int:
     else:
         return round_price(discounted + 90)
 
-
 def format_message(price: float, discount: int, retail: float, sizes: str, season: str) -> str:
     final_price = apply_formula(price, discount)
     return (
@@ -52,7 +49,6 @@ def format_message(price: float, discount: int, retail: float, sizes: str, seaso
         f"{sizes}\n"
         f"{season}"
     )
-
 
 # === ХЕНДЛЕРЫ ===
 @dp.message(F.photo)
@@ -63,20 +59,19 @@ async def handle_photo(msg: Message):
         "caption": msg.caption or "",
     }
 
-
 @dp.message(F.text)
 async def handle_text(msg: Message):
     chat_id = msg.chat.id
     if chat_id not in last_media:
         return
 
-    # Проверяем, не прошло ли время
+    # Проверяем окно времени
     if datetime.now() - last_media[chat_id]["ts"] > timedelta(seconds=WAIT_TEXT_SECONDS):
         return
 
     text = msg.text.strip()
 
-    # Ищем в тексте цену и скидку
+    # Ищем данные в тексте
     price_match = re.search(r"(\d+)[€]", text)
     discount_match = re.search(r"-(\d+)%", text)
     retail_match = re.search(r"Retail price (\d+)", text, re.IGNORECASE)
@@ -92,25 +87,24 @@ async def handle_text(msg: Message):
 
         result = format_message(price, discount, retail, sizes, season)
 
-        # Пересылаем в группу
+        # Сообщение с результатом
         await bot.send_message(TARGET_CHAT_ID, result)
 
-        # Отправляем фото с подписью
+        # Отправляем фото с подписью (НЕ media_group, т.к. фото всего одно)
         if last_media[chat_id]["file_ids"]:
-            media = [InputMediaPhoto(last_media[chat_id]["file_ids"][0], caption=result)]
-            await bot.send_media_group(TARGET_CHAT_ID, media)
+            await bot.send_photo(
+                TARGET_CHAT_ID,
+                last_media[chat_id]["file_ids"][0],
+                caption=result
+            )
 
     # Чистим память
     del last_media[chat_id]
 
-
 # === ЗАПУСК ===
 async def main():
-    try:
-        await dp.start_polling(bot)
-    except RetryAfter as e:
-        await asyncio.sleep(e.timeout)
-        await main()
+    # Без RetryAfter: aiogram 3.7 его не отдаёт; Render сам перезапустит при падении
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
