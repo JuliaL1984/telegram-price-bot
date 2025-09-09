@@ -92,7 +92,7 @@ async def handle_text(msg: Message):
         # Сообщение с результатом
         await bot.send_message(TARGET_CHAT_ID, result)
 
-        # Отправляем фото с подписью (одним фото — через send_photo)
+        # Отправляем фото с подписью
         if last_media[chat_id]["file_ids"]:
             await bot.send_photo(
                 TARGET_CHAT_ID,
@@ -105,7 +105,9 @@ async def handle_text(msg: Message):
 
 # === ЗАПУСК ===
 async def main():
-    await dp.start_polling(bot)
+    # Сбрасываем webhook и очищаем очередь (решение для TelegramConflictError)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
     asyncio.run(main())
