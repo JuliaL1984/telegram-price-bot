@@ -1,7 +1,6 @@
-# bot.py — 30+ режимов + Tesseract OCR + строгие правила удаления ценника + уведомления
+# bot.py — 30+ режимов + Tesseract OCR + строгое удаление ценника + уведомления
 import os
 import re
-import io
 import asyncio
 import tempfile
 from typing import Dict, Callable, Optional
@@ -21,40 +20,28 @@ from PIL import Image
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002973176038"))  # куда публикуем
 WAIT_TEXT_SECONDS = int(os.getenv("WAIT_TEXT_SECONDS", "8"))         # окно ожидания текста после фото (сек)
-# Админы, которым разрешено переключать режимы (перечислить user_id через запятую в ENV ADMIN_IDS)
 ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-# (опционально) язык Tesseract — добавь 'ita' при установке языкового пакета
-TESS_LANG = os.getenv("TESS_LANG", "eng")  # примеры: 'eng' | 'eng+ita'
-
-# Писать ли предупреждение, если ценник не удалён по строгим условиям
+# Язык Tesseract (лучше eng+ita для 'prezzo')
+TESS_LANG = os.getenv("TESS_LANG", "eng")
+# Писать ли предупреждение, если не удаляем ценник
 PRICETAG_NOTICE = os.getenv("PRICETAG_NOTICE", "1") == "1"
 
 # ===================== ИНИЦИАЛИЗАЦИЯ =================
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# Память для «фото → подпись»
-# сохраняем ещё ocr_text и retail_from_ocr + флаг is_pricetag и причины
-last_media: Dict[int, Dict] = {}       # по chat.id: {"ts": dt, "file_ids": [...], "caption": str, "ocr": str, "retail_from_ocr": float, "is_pricetag": bool, "euro_present": bool, "keyword_present": bool, "message_id": int}
-# Активный режим по пользователю (или по чату — как удобнее). Здесь — по отправителю.
-active_mode: Dict[int, str] = {}       # user_id -> mode_key
-
+# Память
+last_media: Dict[int, Dict] = {}    # chat_id -> {...}
+active_mode: Dict[int, str] = {}    # user_id -> mode_key
 
 # ===================== ВСПОМОГАТЕЛЬНОЕ =================
 def round_price(value: float) -> int:
     return int(round(value, 0))
 
 def default_calc(price: float, discount: int) -> int:
-    """
-    Базовая формула:
-    - Сначала скидка, затем наценка по диапазону.
-    """
     discounted = price * (1 - discount / 100)
     if discounted <= 250:
         return round_price(discounted + 55)
@@ -64,9 +51,6 @@ def default_calc(price: float, discount: int) -> int:
         return round_price(discounted + 90)
 
 def default_template(final_price: int, retail: float, sizes: str, season: str, mode_label: Optional[str] = None) -> str:
-    """
-    Базовый шаблон оформления. Если нужен ярлык режима — показываем.
-    """
     tag = f"<i>({mode_label})</i>\n" if mode_label else ""
     sizes_str = sizes or ""
     season_str = season or ""
@@ -79,61 +63,39 @@ def default_template(final_price: int, retail: float, sizes: str, season: str, m
     ).strip()
 
 def cleanup_text_basic(text: str) -> str:
-    """
-    Простой клинап: убрать хэштеги и типичные бренды.
-    """
     text = re.sub(r"#\w+", "", text)
     text = re.sub(r"(?i)\b(Gucci|Prada|Louis\s*Vuitton|LV|Stone\s*Island|Balenciaga|Bally|Jimmy\s*Choo)\b", "", text)
-    # убрать повторные пробелы/переносы
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 def parse_input(text: str) -> Dict[str, Optional[str]]:
-    """
-    Достаём из текста:
-      - price (первое число перед €)
-      - discount (после -..%)
-      - retail (Retail price NNN)
-      - sizes (маска XS/S/M/L/XL/XXL...)
-      - season (FWxx/xx или SSxx)
-    Если retail не нашли — берём равным price.
-    """
-    price_m = re.search(rr"(\d+)\s*€", text)
-    discount_m = re.search(rr"-(\d+)%", text)
-    retail_m = re.search(rr"Retail\s*price\s*(\d+)", text, re.IGNORECASE)
-    sizes_m = re.search(rr"((?:XS|S|M|L|XL|XXL)[^\n]*)", text, flags=re.I)  # простая эвристика
-    season_m = re.search(rr"(FW\d+\/\d+|SS\d+)", text)
+    price_m   = re.search(r"(\d+)\s*€", text)
+    discount_m= re.search(r"-(\d+)%", text)
+    retail_m  = re.search(r"Retail\s*price\s*(\d+)", text, re.IGNORECASE)
+    sizes_m   = re.search(r"((?:XS|S|M|L|XL|XXL)[^\n]*)", text, flags=re.I)
+    season_m  = re.search(r"(FW\d+\/\d+|SS\d+)", text)
 
-    price = float(price_m.group(1)) if price_m else None
+    price    = float(price_m.group(1)) if price_m else None
     discount = int(discount_m.group(1)) if discount_m else 0
-    retail = float(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
-    sizes = sizes_m.group(1).strip() if sizes_m else ""
-    season = season_m.group(1) if season_m else ""
+    retail   = float(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
+    sizes    = sizes_m.group(1).strip() if sizes_m else ""
+    season   = season_m.group(1) if season_m else ""
 
     return {"price": price, "discount": discount, "retail": retail, "sizes": sizes, "season": season}
 
 # ---------- OCR (Tesseract) ----------
 async def ocr_text_from_photo_tesseract(message: Message) -> str:
-    """
-    Скачиваем самое большое фото и распознаём через Tesseract.
-    """
     file_id = message.photo[-1].file_id
     tg_file = await bot.get_file(file_id)
     with tempfile.TemporaryDirectory() as td:
         local = os.path.join(td, "img.jpg")
         await bot.download_file(tg_file.file_path, destination=local)
         img = Image.open(local)
-        # При желании можно добавить предобработку (увеличить контраст/резкость)
         text = pytesseract.image_to_string(img, lang=TESS_LANG)
         return text.strip()
 
 def parse_price_from_text(txt: str) -> Optional[float]:
-    """
-    Ищем цены в евро и выбираем самое большое число (обычно Retail).
-    Поддерживает: 1 990, 1.990, 1990, EUR 1.990, 1990€ и т.п.
-    Приоритет числам c €/EUR.
-    """
     if not txt:
         return None
     one_line = txt.replace("\n", " ")
@@ -141,31 +103,22 @@ def parse_price_from_text(txt: str) -> Optional[float]:
     def to_num(s: str) -> float:
         return float(s.replace(" ", "").replace(".", "").replace(",", ""))
 
-    # Сначала значения с явной валютой
-    with_currency = re.findall(rr"(?:EUR\s*)?(\d{1,3}(?:[\s.,]\d{3})*|\d+)\s*(?:€|EUR)", one_line, flags=re.I)
+    with_currency = re.findall(r"(?:EUR\s*)?(\d{1,3}(?:[\s.,]\d{3})*|\d+)\s*(?:€|EUR)", one_line, flags=re.I)
     if with_currency:
         try:
             return max(to_num(x) for x in with_currency)
         except Exception:
             pass
 
-    # Если валюты нет — смотрим крупные числа
-    plain = re.findall(rr"(?<![\d.,])(\d{1,3}(?:[\s.,]\d{3})*|\d+)(?![\d.,])", one_line)
+    plain = re.findall(r"(?<![\d.,])(\d{1,3}(?:[\s.,]\d{3})*|\d+)(?![\d.,])", one_line)
     if plain:
         try:
             return max(to_num(x) for x in plain)
         except Exception:
             pass
-
     return None
 
 def looks_like_pricetag(txt: str) -> bool:
-    """
-    Строгий критерий:
-    - в тексте есть символ '€'
-    - и есть одно из слов: 'prezzo' / 'price' / 'retail' (без учёта регистра)
-    Только тогда считаем фото ценником и разрешаем удаление.
-    """
     if not txt:
         return False
     t = txt.lower()
@@ -173,59 +126,51 @@ def looks_like_pricetag(txt: str) -> bool:
     has_keyword = ("prezzo" in t) or ("price" in t) or ("retail" in t)
     return has_euro and has_keyword
 
-
-# ===================== РЕЕСТР РЕЖИМОВ =================
+# ===================== РЕЖИМЫ =================
 def mk_mode(label: str,
             calc: Callable[[float, int], int] = default_calc,
             template: Callable[[int, float, str, str, Optional[str]], str] = default_template):
     return {"label": label, "calc": calc, "template": template}
 
 MODES: Dict[str, Dict] = {
-    # БАЗОВЫЕ
-    "sale":     mk_mode("SALE"),
-    "lux":      mk_mode("LUX"),
-    "outlet":   mk_mode("OUTLET"),
-    "stock":    mk_mode("STOCK"),
-    "newfw":    mk_mode("NEW FW"),
-    "newss":    mk_mode("NEW SS"),
-
-    # СУМКИ
-    "bags10":   mk_mode("BAGS -10%"),
-    "bags15":   mk_mode("BAGS -15%"),
-    "bags20":   mk_mode("BAGS -20%"),
-    "bags25":   mk_mode("BAGS -25%"),
-    "bags30":   mk_mode("BAGS -30%"),
-    "bags40":   mk_mode("BAGS -40%"),
-
-    # ОБУВЬ
-    "shoes10":  mk_mode("SHOES -10%"),
-    "shoes20":  mk_mode("SHOES -20%"),
-    "shoes30":  mk_mode("SHOES -30%"),
-    "shoes40":  mk_mode("SHOES -40%"),
-
-    # ОДЕЖДА
-    "rtw10":    mk_mode("RTW -10%"),
-    "rtw20":    mk_mode("RTW -20%"),
-    "rtw30":    mk_mode("RTW -30%"),
-    "rtw40":    mk_mode("RTW -40%"),
-
-    # АКСЕССУАРЫ
-    "acc10":    mk_mode("ACCESSORIES -10%"),
-    "acc20":    mk_mode("ACCESSORIES -20%"),
-    "acc30":    mk_mode("ACCESSORIES -30%"),
-
-    # МУЖ/ЖЕН
-    "men":      mk_mode("MEN"),
-    "women":    mk_mode("WOMEN"),
-
-    # СПЕЦ. СХЕМЫ (оставлены для будущих формул)
-    "vip":      mk_mode("VIP"),
-    "promo":    mk_mode("PROMO"),
-    "flash":    mk_mode("FLASH"),
-    "bundle":   mk_mode("BUNDLE"),
-    "limited":  mk_mode("LIMITED"),
-
-    # РЕЗЕРВ ДЛЯ ДОБИВКИ
+    # базовые
+    "sale": mk_mode("SALE"),
+    "lux": mk_mode("LUX"),
+    "outlet": mk_mode("OUTLET"),
+    "stock": mk_mode("STOCK"),
+    "newfw": mk_mode("NEW FW"),
+    "newss": mk_mode("NEW SS"),
+    # сумки
+    "bags10": mk_mode("BAGS -10%"),
+    "bags15": mk_mode("BAGS -15%"),
+    "bags20": mk_mode("BAGS -20%"),
+    "bags25": mk_mode("BAGS -25%"),
+    "bags30": mk_mode("BAGS -30%"),
+    "bags40": mk_mode("BAGS -40%"),
+    # обувь
+    "shoes10": mk_mode("SHOES -10%"),
+    "shoes20": mk_mode("SHOES -20%"),
+    "shoes30": mk_mode("SHOES -30%"),
+    "shoes40": mk_mode("SHOES -40%"),
+    # одежда
+    "rtw10": mk_mode("RTW -10%"),
+    "rtw20": mk_mode("RTW -20%"),
+    "rtw30": mk_mode("RTW -30%"),
+    "rtw40": mk_mode("RTW -40%"),
+    # аксессуары
+    "acc10": mk_mode("ACCESSORIES -10%"),
+    "acc20": mk_mode("ACCESSORIES -20%"),
+    "acc30": mk_mode("ACCESSORIES -30%"),
+    # муж/жен
+    "men": mk_mode("MEN"),
+    "women": mk_mode("WOMEN"),
+    # спец
+    "vip": mk_mode("VIP"),
+    "promo": mk_mode("PROMO"),
+    "flash": mk_mode("FLASH"),
+    "bundle": mk_mode("BUNDLE"),
+    "limited": mk_mode("LIMITED"),
+    # резерв
     "m1": mk_mode("M1"),
     "m2": mk_mode("M2"),
     "m3": mk_mode("M3"),
@@ -234,11 +179,9 @@ MODES: Dict[str, Dict] = {
 }
 
 def is_admin(user_id: int) -> bool:
-    # если список админов не задан — разрешаем всем (удобно на старте)
     return (not ADMINS) or (user_id in ADMINS)
 
-
-# ===================== КОМАНДЫ РЕЖИМОВ =================
+# ===================== КОМАНДЫ =================
 @router.message(Command(commands=list(MODES.keys())))
 async def set_mode(msg: Message):
     user_id = msg.from_user.id
@@ -269,13 +212,12 @@ async def show_help(msg: Message):
     )
     await msg.answer(txt)
 
-
-# ===================== ХЕНДЛЕРЫ КОНТЕНТА =================
+# ===================== ХЕНДЛЕРЫ =================
 @router.message(F.photo)
 async def handle_photo(msg: Message):
     """
     На любое фото запускаем OCR.
-    Если по строгому правилу (есть '€' и слово prezzo/price/retail) — считаем фото ценником.
+    Если OCR содержит символ '€' и слово prezzo/price/retail — считаем это ценником.
     """
     ocr_text = ""
     retail_from_ocr = None
@@ -293,7 +235,6 @@ async def handle_photo(msg: Message):
             is_pricetag = True
             retail_from_ocr = parse_price_from_text(ocr_text)
     except Exception:
-        # OCR не критичен — просто продолжаем без него
         pass
 
     last_media[msg.chat.id] = {
@@ -308,37 +249,29 @@ async def handle_photo(msg: Message):
         "message_id": msg.message_id,
     }
 
-
 @router.message(F.text)
 async def handle_text(msg: Message):
     chat_id = msg.chat.id
     user_id = msg.from_user.id
 
-    # есть ли свежее фото в окне ожидания?
     media = last_media.get(chat_id)
     if not media:
         return
     if datetime.now() - media["ts"] > timedelta(seconds=WAIT_TEXT_SECONDS):
-        # окно истекло
         del last_media[chat_id]
         return
 
-    # берём активный режим пользователя (или дефолт)
     mode_key = active_mode.get(user_id, "sale")
     mode = MODES.get(mode_key, MODES["sale"])
     label = mode["label"]
     calc_fn = mode["calc"]
     tpl_fn = mode["template"]
 
-    # клинап и парсинг
-    raw_text = msg.text.strip()
-    cleaned = cleanup_text_basic(raw_text)
+    cleaned = cleanup_text_basic(msg.text.strip())
     data = parse_input(cleaned)
 
-    # Если OCR нашёл retail — используем его приоритетно
     if media.get("retail_from_ocr"):
         data["retail"] = media["retail_from_ocr"]
-        # Если price не указан в тексте — логично приравнять к retail (цена на ценнике)
         if not data.get("price"):
             data["price"] = data["retail"]
 
@@ -348,33 +281,27 @@ async def handle_text(msg: Message):
     sizes = data.get("sizes", "")
     season = data.get("season", "")
 
-    # если не смогли извлечь price — вежливо подсказать
     if price is None:
         await msg.answer("Не нашла цену в тексте/на фото. Укажи число перед € (например, <code>650€ -35%</code>).")
         del last_media[chat_id]
         return
 
-    # расчёт и шаблон
     final_price = calc_fn(price, discount)
     result_msg = tpl_fn(final_price, retail, sizes, season, mode_label=label)
 
-    # 1) публикуем текст
     await bot.send_message(TARGET_CHAT_ID, result_msg)
 
-    # 2) публикуем фото с той же подписью
     file_ids = media.get("file_ids") or []
     if file_ids:
         await bot.send_photo(TARGET_CHAT_ID, file_ids[0], caption=result_msg)
 
-    # 3) если это был ценник — пробуем удалить исходное фото из рабочего чата
     if media.get("is_pricetag"):
         try:
             await bot.delete_message(chat_id, media["message_id"])
         except Exception:
             if PRICETAG_NOTICE:
-                await msg.answer("⚠️ Не удалось удалить фото ценника: у бота нет права «Удалять сообщения» в этой группе/канале.")
+                await msg.answer("⚠️ Не удалось удалить фото ценника: у бота нет права «Удалять сообщения».")
     else:
-        # Был retail с OCR, но строгие условия на удаление не выполнены — объясним почему
         if PRICETAG_NOTICE and media.get("retail_from_ocr"):
             reasons = []
             if not media.get("euro_present"):
@@ -384,9 +311,7 @@ async def handle_text(msg: Message):
             if reasons:
                 await msg.answer("⚠️ Фото не удалено: " + "; ".join(reasons) + ".")
 
-    # очистка памяти для этого чата
     del last_media[chat_id]
-
 
 # ===================== ЗАПУСК =================
 async def main():
