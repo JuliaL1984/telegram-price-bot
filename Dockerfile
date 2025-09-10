@@ -1,17 +1,20 @@
-# Используем официальный Python образ
+# Используем официальный лёгкий образ Python
 FROM python:3.11-slim
 
-# Делаем рабочую папку внутри контейнера
+# Устанавливаем Tesseract OCR + итальянский язык
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    tesseract-ocr-ita \
+    && rm -rf /var/lib/apt/lists/*
+
+# Создаём рабочую директорию
 WORKDIR /app
 
-# Копируем список зависимостей
-COPY requirements.txt .
-
-# Устанавливаем зависимости
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Копируем весь проект (включая bot.py)
+# Копируем проект в контейнер
 COPY . .
+
+# Устанавливаем Python-зависимости
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Запуск бота
 CMD ["python", "bot.py"]
