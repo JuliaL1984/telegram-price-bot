@@ -35,6 +35,8 @@ dp.include_router(router)
 last_media: Dict[int, Dict] = {}             # {chat_id: {"ts", "file_ids", "caption", "mgid"}}
 active_mode: Dict[int, str] = {}             # {user_id: "mode"}
 album_buffers: Dict[Tuple[int, str], Dict] = {}  # {(chat_id, media_group_id): {"items", "caption", "task", "user_id"}}
+# Очередь на публикацию (чтобы сохранялся порядок постов)
+publish_lock = asyncio.Lock()
 
 # ====== ВСПОМОГАТЕЛЬНОЕ ======
 def round_price(value: float) -> int:
@@ -126,12 +128,13 @@ def is_admin(user_id: int) -> bool:
 async def publish_to_target(file_ids: List[str], caption: str):
     if not file_ids:
         return
-    if len(file_ids) == 1:
-        await bot.send_photo(TARGET_CHAT_ID, file_ids[0], caption=caption)
-    else:
-        media = [InputMediaPhoto(media=file_ids[0], caption=caption, parse_mode=ParseMode.HTML)]
-        media += [InputMediaPhoto(media=fid) for fid in file_ids[1:]]
-        await bot.send_media_group(TARGET_CHAT_ID, media)
+    async with publish_lock:  # гарантируем порядок публикаций
+        if len(file_ids) == 1:
+            await bot.send_photo(TARGET_CHAT_ID, file_ids[0], caption=caption)
+        else:
+            media = [InputMediaPhoto(media=file_ids[0], caption=caption, parse_mode=ParseMode.HTML)]
+            media += [InputMediaPhoto(media=fid) for fid in file_ids[1:]]
+            await bot.send_media_group(TARGET_CHAT_ID, media)
 
 # ====== OCR ======
 if OCR_ENABLED:
@@ -280,7 +283,7 @@ async def handle_album_photo(msg: Message):
                 return
 
         await _remember_media_for_text(chat_id, file_ids, mgid=mgid, caption=caption)
-        # Подсказку шлем только если ещё нет свежего ожидания текста, чтобы не дублировать
+        # Подсказку шлём только если ещё нет свежего ожидания текста
         lm = last_media.get(chat_id)
         if not (lm and (datetime.now() - lm["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS))):
             try:
