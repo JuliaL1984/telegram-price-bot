@@ -1,9 +1,9 @@
-# bot.py — альбомы, 30+ режимов, OCR ценника
+# bot.py — альбомы, 30+ режимов, OCR ценника, дебаунс 0.8с для альбомов, подсказки при отсутствии цены
 import os
 import re
 import io
 import asyncio
-from typing import Dict, Callable, Optional, List
+from typing import Dict, Callable, Optional, List, Tuple
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -17,12 +17,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002973176038"))
 ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-# окно «собрать альбом» (сек) — только чтобы поймать все фото из media_group
-ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
+ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "800"))  # короткий дебаунс для альбомов
+ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))  # окно для текстового хендлера
 
-# OCR ценника (Tesseract). 1/0 — включить/выключить.
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
-# языки OCR (нужны соответствующие языковые пакеты в образе)
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
 
 # ====== ИНИЦИАЛИЗАЦИЯ ======
@@ -32,17 +30,15 @@ router = Router()
 dp.include_router(router)
 
 # ====== ПАМЯТЬ ======
-# по chat.id: {"ts": dt, "file_ids": [...], "caption": str, "mgid": media_group_id}
 last_media: Dict[int, Dict] = {}
-# активный режим по user_id
 active_mode: Dict[int, str] = {}
+album_buffers: Dict[Tuple[int, str], Dict] = {}
 
 # ====== ВСПОМОГАТЕЛЬНОЕ ======
 def round_price(value: float) -> int:
     return int(round(value, 0))
 
 def default_calc(price: float, discount: int) -> int:
-    """Сначала скидка, затем наценка по диапазону."""
     discounted = price * (1 - discount / 100)
     if discounted <= 250:
         return round_price(discounted + 55)
@@ -59,7 +55,7 @@ def default_template(final_price: int, retail: float, sizes: str, season: str, m
         f"❌ <b>Retail price {round_price(retail)}€</b>\n"
         f"{sizes}\n"
         f"{season}"
-    )
+    ).strip()
 
 def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"#\w+", "", text)
@@ -69,20 +65,11 @@ def cleanup_text_basic(text: str) -> str:
     return text.strip()
 
 def parse_input(text: str) -> Dict[str, Optional[str]]:
-    """
-    Достаём:
-      - price: первое число перед символом €
-      - discount: -NN%
-      - retail: 'Retail price NNN'
-      - sizes: строка, начинающаяся с XS/S/M/L/XL/XXL
-      - season: FWxx/xx или SSxx
-    """
     price_m   = re.search(r"(\d+)\s*€", text)
     discount_m= re.search(r"-(\d+)%", text)
     retail_m  = re.search(r"Retail\s*price\s*(\d+)", text, flags=re.I)
     sizes_m   = re.search(r"((?:XS|S|M|L|XL|XXL)[^\n]*)", text, flags=re.I)
     season_m  = re.search(r"(FW\d+\/\d+|SS\d+)", text)
-
     price   = float(price_m.group(1)) if price_m else None
     discount= int(discount_m.group(1)) if discount_m else 0
     retail  = float(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
@@ -96,44 +83,31 @@ def mk_mode(label: str,
     return {"label": label, "calc": calc, "template": template}
 
 MODES: Dict[str, Dict] = {
-    # БАЗОВЫЕ
-    "sale":   mk_mode("SALE"),
-    "lux":    mk_mode("LUX"),
+    "sale": mk_mode("SALE"),
+    "lux": mk_mode("LUX"),
     "outlet": mk_mode("OUTLET"),
-    "stock":  mk_mode("STOCK"),
-    "newfw":  mk_mode("NEW FW"),
-    "newss":  mk_mode("NEW SS"),
-
-    # СУМКИ
+    "stock": mk_mode("STOCK"),
+    "newfw": mk_mode("NEW FW"),
+    "newss": mk_mode("NEW SS"),
     "bags10": mk_mode("BAGS -10%"),
     "bags15": mk_mode("BAGS -15%"),
     "bags20": mk_mode("BAGS -20%"),
     "bags25": mk_mode("BAGS -25%"),
     "bags30": mk_mode("BAGS -30%"),
     "bags40": mk_mode("BAGS -40%"),
-
-    # ОБУВЬ
     "shoes10": mk_mode("SHOES -10%"),
     "shoes20": mk_mode("SHOES -20%"),
     "shoes30": mk_mode("SHOES -30%"),
     "shoes40": mk_mode("SHOES -40%"),
-
-    # ОДЕЖДА
     "rtw10": mk_mode("RTW -10%"),
     "rtw20": mk_mode("RTW -20%"),
     "rtw30": mk_mode("RTW -30%"),
     "rtw40": mk_mode("RTW -40%"),
-
-    # АКСЕССУАРЫ
     "acc10": mk_mode("ACCESSORIES -10%"),
     "acc20": mk_mode("ACCESSORIES -20%"),
     "acc30": mk_mode("ACCESSORIES -30%"),
-
-    # М/Ж
     "men": mk_mode("MEN"),
     "women": mk_mode("WOMEN"),
-
-    # СПЕЦ/РЕЗЕРВ
     "vip": mk_mode("VIP"),
     "promo": mk_mode("PROMO"),
     "flash": mk_mode("FLASH"),
@@ -145,33 +119,25 @@ MODES: Dict[str, Dict] = {
 def is_admin(user_id: int) -> bool:
     return (not ADMINS) or (user_id in ADMINS)
 
-# ====== ПУБЛИКАЦИЯ (фото/альбом) ======
+# ====== ПУБЛИКАЦИЯ ======
 async def publish_to_target(file_ids: List[str], caption: str):
-    if not file_ids:
-        return
+    if not file_ids: return
     if len(file_ids) == 1:
         await bot.send_photo(TARGET_CHAT_ID, file_ids[0], caption=caption)
     else:
-        media = []
-        for i, fid in enumerate(file_ids):
-            if i == 0:
-                media.append(InputMediaPhoto(media=fid, caption=caption, parse_mode=ParseMode.HTML))
-            else:
-                media.append(InputMediaPhoto(media=fid))
+        media = [InputMediaPhoto(media=file_ids[0], caption=caption, parse_mode=ParseMode.HTML)]
+        media += [InputMediaPhoto(media=fid) for fid in file_ids[1:]]
         await bot.send_media_group(TARGET_CHAT_ID, media)
 
-# ====== OCR ценника ======
+# ====== OCR ======
 if OCR_ENABLED:
     try:
         import pytesseract
         from PIL import Image
-    except Exception as _:
-        OCR_ENABLED = False  # на всякий случай, если библиотек нет
+    except Exception:
+        OCR_ENABLED = False
 
 async def ocr_should_hide(file_id: str) -> bool:
-    """
-    True — если на фото есть символ '€' и слово из {'prezzo','price','retail'} (регистр не важен).
-    """
     if not OCR_ENABLED:
         return False
     try:
@@ -189,12 +155,11 @@ async def ocr_should_hide(file_id: str) -> bool:
         return False
 
 async def filter_pricetag_photos(file_ids: List[str]) -> List[str]:
-    res: List[str] = []
+    res = []
     for fid in file_ids:
         hide = await ocr_should_hide(fid)
         if not hide:
             res.append(fid)
-    # если вдруг отфильтровали всё — вернём хотя бы первую, чтобы не потерять пост
     return res or (file_ids[:1])
 
 # ====== КОМАНДЫ ======
@@ -203,114 +168,103 @@ async def set_mode(msg: Message):
     user_id = msg.from_user.id
     cmd = msg.text.lstrip("/").split()[0]
     if not is_admin(user_id):
-        return await msg.answer("⛔ Доступно только администраторам.")
+        return await msg.answer("⛔ Только для админов.")
     active_mode[user_id] = cmd
-    label = MODES[cmd]["label"]
-    await msg.answer(f"✅ Режим <b>{label}</b> активирован.")
-
-@router.message(Command("mode"))
-async def show_mode(msg: Message):
-    user_id = msg.from_user.id
-    mode = active_mode.get(user_id, "sale")
-    label = MODES.get(mode, {}).get("label", mode)
-    await msg.answer(f"Текущий режим: <b>{label}</b>\nСменить: /" + " /".join(list(MODES.keys())[:10]) + " …")
+    await msg.answer(f"✅ Режим <b>{MODES[cmd]['label']}</b> активирован.")
 
 @router.message(Command("help"))
 async def show_help(msg: Message):
-    await msg.answer(
-        "<b>Как работать:</b>\n"
-        "— Отправь фото товара (одиночное или альбом).\n"
-        "— Следом пришли текст с ценой/скидкой/размерами/сезоном.\n"
-        "— Одиночное фото с подписью «650€ -35%» публикуется сразу.\n"
-        "— Бот посчитает и опубликует в целевой группе одним постом."
-    )
+    await msg.answer("Бот принимает фото/альбомы с ценой. Если цены нет — публикует с подсказкой ⚠️.")
 
-@router.message(Command("ping"))
-async def ping(msg: Message):
-    await msg.answer("pong")
-
-# ====== ХЕНДЛЕРЫ КОНТЕНТА ======
-@router.message(F.photo)
-async def handle_photo(msg: Message):
-    """
-    1) Одиночное фото + подпись «650€ -35%» → публикация сразу.
-    2) Альбом (media_group) или фото без подписи → складываем в память, ждём текст.
-    """
-    chat_id = msg.chat.id
-    mgid = msg.media_group_id  # None для одиночной
-
-    # кейс 1: одиночное фото С подписью, подпись парсится → публикуем сразу
-    if mgid is None and msg.caption:
-        cleaned = cleanup_text_basic(msg.caption)
-        data = parse_input(cleaned)
-        price = data.get("price")
-        if price is not None:
-            user_id = msg.from_user.id
-            mode_key = active_mode.get(user_id, "sale")
-            mode = MODES.get(mode_key, MODES["sale"])
-            label = mode["label"]
-            calc_fn = mode["calc"]
-            tpl_fn = mode["template"]
-
-            final_price = calc_fn(price, data.get("discount", 0))
-            result_msg = tpl_fn(final_price, data.get("retail", 0.0), data.get("sizes", ""), data.get("season", ""), mode_label=label)
-
-            fids = [msg.photo[-1].file_id]
-            # фильтруем ценники (если включен OCR)
-            fids = await filter_pricetag_photos(fids)
-            await publish_to_target(fids, result_msg)
-            return  # ничего в память не кладём
-
-    # кейс 2: альбом/без подписи → буферизуем
-    bucket = last_media.get(chat_id)
-    now = datetime.now()
-    if not bucket or (now - bucket["ts"]).total_seconds() > ALBUM_WINDOW_SECONDS:
-        last_media[chat_id] = {
-            "ts": now,
-            "file_ids": [msg.photo[-1].file_id],
-            "caption": msg.caption or "",
-            "mgid": mgid,
-        }
-    else:
-        bucket["file_ids"].append(msg.photo[-1].file_id)
-        if msg.caption and not bucket.get("caption"):
-            bucket["caption"] = msg.caption
-
-@router.message(F.text)
-async def handle_text(msg: Message):
-    chat_id = msg.chat.id
-    user_id = msg.from_user.id
-
-    bucket = last_media.get(chat_id)
-    if not bucket:
-        return  # текст сам по себе нам не нужен
-
-    if datetime.now() - bucket["ts"] > timedelta(seconds=ALBUM_WINDOW_SECONDS):
-        del last_media[chat_id]
-        return
-
-    mode_key = active_mode.get(user_id, "sale")
-    mode = MODES.get(mode_key, MODES["sale"])
-    label = mode["label"]
-    calc_fn = mode["calc"]
-    tpl_fn = mode["template"]
-
-    raw_text = (bucket.get("caption") or "") + "\n" + (msg.text or "")
-    cleaned = cleanup_text_basic(raw_text)
+# ====== ХЕНДЛЕРЫ ======
+def build_result_text(user_id: int, caption: str) -> Optional[str]:
+    cleaned = cleanup_text_basic(caption)
     data = parse_input(cleaned)
-
     price = data.get("price")
     if price is None:
-        del last_media[chat_id]
-        return
-
+        return None
+    mode = MODES.get(active_mode.get(user_id, "sale"), MODES["sale"])
+    calc_fn, tpl_fn, label = mode["calc"], mode["template"], mode["label"]
     final_price = calc_fn(price, data.get("discount", 0))
-    result_msg = tpl_fn(final_price, data.get("retail", 0.0), data.get("sizes", ""), data.get("season", ""), mode_label=label)
+    return tpl_fn(final_price, data["retail"], data["sizes"], data["season"], mode_label=label)
 
+# 1) Одиночное фото
+@router.message(F.photo & (F.media_group_id == None))
+async def handle_single_photo(msg: Message):
+    fid = msg.photo[-1].file_id
+    caption = (msg.caption or "").strip()
+    if caption:
+        result = build_result_text(msg.from_user.id, caption)
+        if result:
+            fids = await filter_pricetag_photos([fid])
+            await publish_to_target(fids, result)
+            return
+    warn = "⚠️ <b>Нет цены в подписи.</b> Пример: <code>650€ -35%</code>"
+    final_caption = warn if not caption else f"{warn}\n\n{caption}"
+    fids = await filter_pricetag_photos([fid])
+    await publish_to_target(fids, final_caption)
+
+# 2) Альбом
+@router.message(F.photo & F.media_group_id)
+async def handle_album_photo(msg: Message):
+    chat_id, mgid = msg.chat.id, str(msg.media_group_id)
+    key = (chat_id, mgid)
+    fid, mid = msg.photo[-1].file_id, msg.message_id
+    cap_text = (msg.caption or "").strip()
+    has_cap = bool(cap_text)
+    buf = album_buffers.get(key)
+    if not buf:
+        buf = {"items": [], "caption": "", "task": None, "user_id": msg.from_user.id}
+        album_buffers[key] = buf
+    buf["items"].append({"fid": fid, "mid": mid, "cap": has_cap})
+    if has_cap and not buf["caption"]:
+        buf["caption"] = cap_text
+    if buf["task"]:
+        buf["task"].cancel()
+    async def _flush_album():
+        await asyncio.sleep(ALBUM_SETTLE_MS / 1000)
+        data = album_buffers.pop(key, None)
+        if not data: return
+        items, caption, user_id = data["items"], data["caption"], data["user_id"]
+        items.sort(key=lambda x: x["mid"])
+        idx_cap = next((i for i,it in enumerate(items) if it["cap"]), None)
+        if idx_cap not in (None,0):
+            items.insert(0, items.pop(idx_cap))
+        if not caption:
+            warn = "⚠️ <b>Нет цены в подписи альбома.</b> Пример: <code>650€ -35%</code>"
+            fids = [it["fid"] for it in items]
+            fids = await filter_pricetag_photos(fids)
+            await publish_to_target(fids, warn)
+            return
+        result = build_result_text(user_id, caption)
+        if not result:
+            warn = f"⚠️ <b>Не нашла цену в подписи альбома.</b> Пример: <code>650€ -35%</code>\n\n{caption}"
+            fids = [it["fid"] for it in items]
+            fids = await filter_pricetag_photos(fids)
+            await publish_to_target(fids, warn)
+            return
+        fids = [it["fid"] for it in items]
+        fids = await filter_pricetag_photos(fids)
+        await publish_to_target(fids, result)
+    buf["task"] = asyncio.create_task(_flush_album())
+
+# 3) Текстовый хендлер
+@router.message(F.text)
+async def handle_text(msg: Message):
+    chat_id, user_id = msg.chat.id, msg.from_user.id
+    bucket = last_media.get(chat_id)
+    if not bucket: return
+    if datetime.now() - bucket["ts"] > timedelta(seconds=ALBUM_WINDOW_SECONDS):
+        del last_media[chat_id]; return
+    raw_text = (bucket.get("caption") or "") + "\n" + (msg.text or "")
+    result = build_result_text(user_id, raw_text)
     fids = bucket.get("file_ids") or []
     fids = await filter_pricetag_photos(fids)
-    await publish_to_target(fids, result_msg)
-
+    if not result:
+        warn = f"⚠️ <b>Не нашла цену в тексте.</b> Пример: <code>650€ -35%</code>\n\n{msg.text}"
+        await publish_to_target(fids, warn)
+    else:
+        await publish_to_target(fids, result)
     del last_media[chat_id]
 
 # ====== ЗАПУСК ======
