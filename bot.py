@@ -280,14 +280,17 @@ async def handle_album_photo(msg: Message):
                 return
 
         await _remember_media_for_text(chat_id, file_ids, mgid=mgid, caption=caption)
-        try:
-            await bot.send_message(chat_id, "Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую альбом одним постом.")
-        except Exception:
-            pass
+        # Подсказку шлем только если ещё нет свежего ожидания текста, чтобы не дублировать
+        lm = last_media.get(chat_id)
+        if not (lm and (datetime.now() - lm["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS))):
+            try:
+                await bot.send_message(chat_id, "Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую альбом одним постом.")
+            except Exception:
+                pass
 
     buf["task"] = asyncio.create_task(_flush_album())
 
-# 3) Текст под последними фото/альбомом (с защитой от гонки)
+# 3) Текст под последними фото/альбомом (с правильным сопоставлением и защитой от гонки)
 @router.message(F.text)
 async def handle_text(msg: Message):
     chat_id, user_id = msg.chat.id, msg.from_user.id
@@ -311,10 +314,14 @@ async def handle_text(msg: Message):
         del last_media[chat_id]
         return
 
-    # Вариант 2: альбом ещё в буфере (гонка)
+    # Вариант 2: альбом ещё в буфере (гонка). Выберем тот, чей последний кадр <= id этого текста
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
-        key, data = max(cand, key=lambda kv: max(it["mid"] for it in kv[1]["items"]))
+        def last_mid(buf): return max(it["mid"] for it in buf["items"])
+        cand.sort(key=lambda kv: last_mid(kv[1]))
+        eligible = [kv for kv in cand if last_mid(kv[1]) <= msg.message_id]
+        key, data = (eligible[-1] if eligible else cand[-1])
+
         items = data["items"]
         caption = (data.get("caption") or "")
         if caption:
