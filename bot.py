@@ -44,11 +44,14 @@ async def _do_publish(file_ids: List[str], caption: str):
     """Реальная отправка сообщений (не вызывать напрямую)."""
     if not file_ids:
         return
-    if len(file_ids) == 1:
-        await bot.send_photo(TARGET_CHAT_ID, file_ids[0], caption=caption)
+    # ВАЖНО: OCR-фильтрация выполняется ЗДЕСЬ, внутри воркера,
+    # чтобы дольше обрабатывающиеся посты не обгоняли более быстрые.
+    fids = await filter_pricetag_photos(file_ids)
+    if len(fids) == 1:
+        await bot.send_photo(TARGET_CHAT_ID, fids[0], caption=caption)
     else:
-        media = [InputMediaPhoto(media=file_ids[0], caption=caption, parse_mode=ParseMode.HTML)]
-        media += [InputMediaPhoto(media=fid) for fid in file_ids[1:]]
+        media = [InputMediaPhoto(media=fids[0], caption=caption, parse_mode=ParseMode.HTML)]
+        media += [InputMediaPhoto(media=fid) for fid in fids[1:]]
         await bot.send_media_group(TARGET_CHAT_ID, media)
 
 async def publish_worker():
@@ -58,7 +61,7 @@ async def publish_worker():
         try:
             await _do_publish(file_ids, caption)
         except Exception:
-            # не блокируем очередь из‑за ошибки одного сообщения
+            # не блокируем очередь из-за ошибки одного сообщения
             pass
         finally:
             publish_queue.task_done()
@@ -238,8 +241,8 @@ async def handle_single_photo(msg: Message):
     if caption:
         result = build_result_text(msg.from_user.id, caption)
         if result:
-            fids = await filter_pricetag_photos([fid])
-            await publish_to_target(fids, result)
+            # В очередь без OCR — фильтрация выполнится в воркере
+            await publish_to_target([fid], result)
             return
 
     await _remember_media_for_text(msg.chat.id, [fid], caption=caption)
@@ -290,8 +293,7 @@ async def handle_album_photo(msg: Message):
         if caption:
             result = build_result_text(user_id, caption)
             if result:
-                fids = await filter_pricetag_photos(file_ids)
-                await publish_to_target(fids, result)
+                await publish_to_target(file_ids, result)
                 return
 
         await _remember_media_for_text(chat_id, file_ids, mgid=mgid, caption=caption)
@@ -316,12 +318,12 @@ async def handle_text(msg: Message):
         raw_text += (msg.text or "")
 
         result = build_result_text(user_id, raw_text)
-        fids = await filter_pricetag_photos(bucket.get("file_ids") or [])
+        file_ids = bucket.get("file_ids") or []
 
         if result:
-            await publish_to_target(fids, result)
+            await publish_to_target(file_ids, result)
         else:
-            await publish_to_target(fids, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
+            await publish_to_target(file_ids, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
 
         del last_media[chat_id]
         return
@@ -346,16 +348,15 @@ async def handle_text(msg: Message):
 
         file_ids = [it["fid"] for it in items]
         result = build_result_text(user_id, caption)
-        fids = await filter_pricetag_photos(file_ids)
 
         if data.get("task"):
             data["task"].cancel()
         album_buffers.pop(key, None)
 
         if result:
-            await publish_to_target(fids, result)
+            await publish_to_target(file_ids, result)
         else:
-            await publish_to_target(fids, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
+            await publish_to_target(file_ids, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
         return
 
     return
