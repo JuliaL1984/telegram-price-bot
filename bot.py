@@ -32,9 +32,9 @@ router = Router()
 dp.include_router(router)
 
 # ====== ПАМЯТЬ ======
-last_media: Dict[int, Dict] = {}
-active_mode: Dict[int, str] = {}
-album_buffers: Dict[Tuple[int, str], Dict] = {}
+last_media: Dict[int, Dict] = {}             # {chat_id: {"ts", "file_ids", "caption", "mgid"}}
+active_mode: Dict[int, str] = {}             # {user_id: "mode"}
+album_buffers: Dict[Tuple[int, str], Dict] = {}  # {(chat_id, media_group_id): {"items", "caption", "task", "user_id"}}
 
 # ====== ВСПОМОГАТЕЛЬНОЕ ======
 def round_price(value: float) -> int:
@@ -196,4 +196,159 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
     if price is None:
         return None
     mode = MODES.get(active_mode.get(user_id, "sale"), MODES["sale"])
-    calc_fn, tpl_fn, label = mode["calc"], mode["template"], mode
+    calc_fn, tpl_fn, label = mode["calc"], mode["template"], mode["label"]
+    final_price = calc_fn(price, data.get("discount", 0))
+    return tpl_fn(final_price, data["retail"], data["sizes"], data["season"], mode_label=label)
+
+# ====== ХЕЛПЕР для ожидания текста ======
+async def _remember_media_for_text(chat_id: int, file_ids: List[str], mgid: Optional[str] = None, caption: str = ""):
+    last_media[chat_id] = {
+        "ts": datetime.now(),
+        "file_ids": file_ids,
+        "caption": caption or "",
+        "mgid": mgid or "",
+    }
+
+# ====== ХЕНДЛЕРЫ ======
+
+# 1) Одиночное фото
+@router.message(F.photo & (F.media_group_id == None))
+async def handle_single_photo(msg: Message):
+    fid = msg.photo[-1].file_id
+    caption = (msg.caption or "").strip()
+
+    if caption:
+        result = build_result_text(msg.from_user.id, caption)
+        if result:
+            fids = await filter_pricetag_photos([fid])
+            await publish_to_target(fids, result)
+            return
+
+    # Цены нет — ждём текст
+    await _remember_media_for_text(msg.chat.id, [fid], caption=caption)
+    try:
+        await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую одним постом.")
+    except Exception:
+        pass
+
+# 2) Альбом: собираем кадры; если подписи нет — ждём текст
+@router.message(F.photo & F.media_group_id)
+async def handle_album_photo(msg: Message):
+    chat_id, mgid = msg.chat.id, str(msg.media_group_id)
+    key = (chat_id, mgid)
+
+    fid, mid = msg.photo[-1].file_id, msg.message_id
+    cap_text = (msg.caption or "").strip()
+    has_cap = bool(cap_text)
+
+    buf = album_buffers.get(key)
+    if not buf:
+        buf = {"items": [], "caption": "", "task": None, "user_id": msg.from_user.id}
+        album_buffers[key] = buf
+
+    buf["items"].append({"fid": fid, "mid": mid, "cap": has_cap})
+    if has_cap and not buf["caption"]:
+        buf["caption"] = cap_text
+
+    if buf["task"]:
+        buf["task"].cancel()
+
+    async def _flush_album():
+        await asyncio.sleep(ALBUM_SETTLE_MS / 1000)
+
+        data = album_buffers.pop(key, None)
+        if not data:
+            return
+
+        items = data["items"]
+        caption = data["caption"]
+        user_id = data["user_id"]
+
+        # порядок кадров
+        items.sort(key=lambda x: x["mid"])
+        idx_cap = next((i for i, it in enumerate(items) if it["cap"]), None)
+        if idx_cap not in (None, 0):
+            items.insert(0, items.pop(idx_cap))
+
+        file_ids = [it["fid"] for it in items]
+
+        if caption:
+            result = build_result_text(user_id, caption)
+            if result:
+                fids = await filter_pricetag_photos(file_ids)
+                await publish_to_target(fids, result)
+                return
+
+        await _remember_media_for_text(chat_id, file_ids, mgid=mgid, caption=caption)
+        try:
+            await bot.send_message(chat_id, "Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую альбом одним постом.")
+        except Exception:
+            pass
+
+    buf["task"] = asyncio.create_task(_flush_album())
+
+# 3) Текст под последними фото/альбомом (с защитой от гонки)
+@router.message(F.text)
+async def handle_text(msg: Message):
+    chat_id, user_id = msg.chat.id, msg.from_user.id
+
+    # Вариант 1: уже есть сохранённые медиа
+    bucket = last_media.get(chat_id)
+    if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
+        raw_text = (bucket.get("caption") or "")
+        if raw_text:
+            raw_text += "\n"
+        raw_text += (msg.text or "")
+
+        result = build_result_text(user_id, raw_text)
+        fids = await filter_pricetag_photos(bucket.get("file_ids") or [])
+
+        if result:
+            await publish_to_target(fids, result)
+        else:
+            await publish_to_target(fids, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
+
+        del last_media[chat_id]
+        return
+
+    # Вариант 2: альбом ещё в буфере (гонка)
+    cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
+    if cand:
+        key, data = max(cand, key=lambda kv: max(it["mid"] for it in kv[1]["items"]))
+        items = data["items"]
+        caption = (data.get("caption") or "")
+        if caption:
+            caption += "\n"
+        caption += (msg.text or "")
+
+        # порядок кадров
+        items.sort(key=lambda x: x["mid"])
+        idx_cap = next((i for i, it in enumerate(items) if it["cap"]), None)
+        if idx_cap not in (None, 0):
+            items.insert(0, items.pop(idx_cap))
+
+        file_ids = [it["fid"] for it in items]
+        result = build_result_text(user_id, caption)
+        fids = await filter_pricetag_photos(file_ids)
+
+        # отменяем отложенный слив и убираем буфер
+        if data.get("task"):
+            data["task"].cancel()
+        album_buffers.pop(key, None)
+
+        if result:
+            await publish_to_target(fids, result)
+        else:
+            await publish_to_target(fids, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
+        return
+
+    # Вариант 3: ничего не нашли — игнор
+    return
+
+# ====== ЗАПУСК ======
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+if __name__ == "__main__":
+    asyncio.run(main())
