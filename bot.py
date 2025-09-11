@@ -100,29 +100,7 @@ async def filter_pricetag_photos(file_ids: List[str]) -> List[str]:
             res.append(fid)
     return res or (file_ids[:1])
 
-# ====== КОМАНДЫ ======
-@router.message(Command(commands=list(MODES.keys())))
-async def set_mode(msg: Message):
-    user_id = msg.from_user.id
-    cmd = msg.text.lstrip("/").split()[0]
-    if not is_admin(user_id):
-        return await msg.answer("⛔ Только для админов.")
-    active_mode[user_id] = cmd
-    await msg.answer(f"✅ Режим <b>{MODES[cmd]['label']}</b> активирован.")
-
-@router.message(Command("help"))
-async def show_help(msg: Message):
-    await msg.answer(
-        "Бот принимает фото/альбомы и текст с ценой.\n"
-        "• Фото/альбом без цены — ждём твой текст (до 30с).\n"
-        "• Если текст пришёл — публикуем одним постом."
-    )
-
-@router.message(Command("ping"))
-async def ping(msg: Message):
-    await msg.answer("pong")
-
-# ====== ВСПОМОГ.: сборка подписи по режиму ======
+# ====== ВСПОМОГАТЕЛЬНОЕ ======
 def round_price(value: float) -> int:
     return int(round(value, 0))
 
@@ -208,11 +186,7 @@ MODES: Dict[str, Dict] = {
 def is_admin(user_id: int) -> bool:
     return (not ADMINS) or (user_id in ADMINS)
 
-# ====== ПУБЛИКАЦИЯ ======
-# (отправка идёт через очередь publish_to_target)
-
-# ====== КОМАНДЫ И ПРОЧЕЕ (без изменений из твоей версии) ======
-
+# ====== КОМАНДЫ ======
 @router.message(Command(commands=list(MODES.keys())))
 async def set_mode(msg: Message):
     user_id = msg.from_user.id
@@ -234,6 +208,7 @@ async def show_help(msg: Message):
 async def ping(msg: Message):
     await msg.answer("pong")
 
+# ====== ВСПОМОГ.: сборка подписи по режиму ======
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
     cleaned = cleanup_text_basic(caption)
     data = parse_input(cleaned)
@@ -245,6 +220,7 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
     final_price = calc_fn(price, data.get("discount", 0))
     return tpl_fn(final_price, data["retail"], data["sizes"], data["season"], mode_label=label)
 
+# ====== ХЕЛПЕР для ожидания текста ======
 async def _remember_media_for_text(chat_id: int, file_ids: List[str], mgid: Optional[str] = None, caption: str = ""):
     last_media[chat_id] = {
         "ts": datetime.now(),
@@ -253,7 +229,7 @@ async def _remember_media_for_text(chat_id: int, file_ids: List[str], mgid: Opti
         "mgid": mgid or "",
     }
 
-# --- Хендлеры (оставлены как в твоём файле) ---
+# ====== ХЕНДЛЕРЫ ======
 @router.message(F.photo & (F.media_group_id == None))
 async def handle_single_photo(msg: Message):
     fid = msg.photo[-1].file_id
