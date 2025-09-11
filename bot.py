@@ -1,5 +1,6 @@
 # bot.py — альбомы, 30+ режимов, OCR ценника, дебаунс 0.8с для альбомов,
 # подсказки при отсутствии цены и поддержка "альбом/фото → отдельный текст"
+# + Гарантия порядка публикаций через FIFO-очередь
 
 import os
 import re
@@ -35,10 +36,93 @@ dp.include_router(router)
 last_media: Dict[int, Dict] = {}             # {chat_id: {"ts", "file_ids", "caption", "mgid"}}
 active_mode: Dict[int, str] = {}             # {user_id: "mode"}
 album_buffers: Dict[Tuple[int, str], Dict] = {}  # {(chat_id, media_group_id): {"items", "caption", "task", "user_id"}}
-# Очередь на публикацию (чтобы сохранялся порядок постов)
-publish_lock = asyncio.Lock()
 
-# ====== ВСПОМОГАТЕЛЬНОЕ ======
+# ====== ОЧЕРЕДЬ ПУБЛИКАЦИЙ (FIFO) ======
+publish_queue: "asyncio.Queue[Tuple[List[str], str]]" = asyncio.Queue()
+
+async def _do_publish(file_ids: List[str], caption: str):
+    """Реальная отправка сообщений (не вызывать напрямую)."""
+    if not file_ids:
+        return
+    if len(file_ids) == 1:
+        await bot.send_photo(TARGET_CHAT_ID, file_ids[0], caption=caption)
+    else:
+        media = [InputMediaPhoto(media=file_ids[0], caption=caption, parse_mode=ParseMode.HTML)]
+        media += [InputMediaPhoto(media=fid) for fid in file_ids[1:]]
+        await bot.send_media_group(TARGET_CHAT_ID, media)
+
+async def publish_worker():
+    """Единственный воркер, публикует все задачи по очереди."""
+    while True:
+        file_ids, caption = await publish_queue.get()
+        try:
+            await _do_publish(file_ids, caption)
+        except Exception:
+            # не блокируем очередь из‑за ошибки одного сообщения
+            pass
+        finally:
+            publish_queue.task_done()
+
+async def publish_to_target(file_ids: List[str], caption: str):
+    """Ставит публикацию в очередь (сохраняет порядок)."""
+    await publish_queue.put((file_ids, caption))
+
+# ====== OCR ======
+if OCR_ENABLED:
+    try:
+        import pytesseract
+        from PIL import Image
+    except Exception:
+        OCR_ENABLED = False
+
+async def ocr_should_hide(file_id: str) -> bool:
+    if not OCR_ENABLED:
+        return False
+    try:
+        file = await bot.get_file(file_id)
+        buf = io.BytesIO()
+        await bot.download(file, buf)
+        buf.seek(0)
+        img = Image.open(buf)
+        txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
+        tl = txt.lower()
+        has_euro = "€" in txt or "eur" in tl
+        has_word = any(w in tl for w in ("prezzo", "price", "retail"))
+        return bool(has_euro and has_word)
+    except Exception:
+        return False
+
+async def filter_pricetag_photos(file_ids: List[str]) -> List[str]:
+    res: List[str] = []
+    for fid in file_ids:
+        hide = await ocr_should_hide(fid)
+        if not hide:
+            res.append(fid)
+    return res or (file_ids[:1])
+
+# ====== КОМАНДЫ ======
+@router.message(Command(commands=list(MODES.keys())))
+async def set_mode(msg: Message):
+    user_id = msg.from_user.id
+    cmd = msg.text.lstrip("/").split()[0]
+    if not is_admin(user_id):
+        return await msg.answer("⛔ Только для админов.")
+    active_mode[user_id] = cmd
+    await msg.answer(f"✅ Режим <b>{MODES[cmd]['label']}</b> активирован.")
+
+@router.message(Command("help"))
+async def show_help(msg: Message):
+    await msg.answer(
+        "Бот принимает фото/альбомы и текст с ценой.\n"
+        "• Фото/альбом без цены — ждём твой текст (до 30с).\n"
+        "• Если текст пришёл — публикуем одним постом."
+    )
+
+@router.message(Command("ping"))
+async def ping(msg: Message):
+    await msg.answer("pong")
+
+# ====== ВСПОМОГ.: сборка подписи по режиму ======
 def round_price(value: float) -> int:
     return int(round(value, 0))
 
@@ -125,51 +209,10 @@ def is_admin(user_id: int) -> bool:
     return (not ADMINS) or (user_id in ADMINS)
 
 # ====== ПУБЛИКАЦИЯ ======
-async def publish_to_target(file_ids: List[str], caption: str):
-    if not file_ids:
-        return
-    async with publish_lock:  # гарантируем порядок публикаций
-        if len(file_ids) == 1:
-            await bot.send_photo(TARGET_CHAT_ID, file_ids[0], caption=caption)
-        else:
-            media = [InputMediaPhoto(media=file_ids[0], caption=caption, parse_mode=ParseMode.HTML)]
-            media += [InputMediaPhoto(media=fid) for fid in file_ids[1:]]
-            await bot.send_media_group(TARGET_CHAT_ID, media)
+# (отправка идёт через очередь publish_to_target)
 
-# ====== OCR ======
-if OCR_ENABLED:
-    try:
-        import pytesseract
-        from PIL import Image
-    except Exception:
-        OCR_ENABLED = False
+# ====== КОМАНДЫ И ПРОЧЕЕ (без изменений из твоей версии) ======
 
-async def ocr_should_hide(file_id: str) -> bool:
-    if not OCR_ENABLED:
-        return False
-    try:
-        file = await bot.get_file(file_id)
-        buf = io.BytesIO()
-        await bot.download(file, buf)
-        buf.seek(0)
-        img = Image.open(buf)
-        txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
-        tl = txt.lower()
-        has_euro = "€" in txt or "eur" in tl
-        has_word = any(w in tl for w in ("prezzo", "price", "retail"))
-        return bool(has_euro and has_word)
-    except Exception:
-        return False
-
-async def filter_pricetag_photos(file_ids: List[str]) -> List[str]:
-    res: List[str] = []
-    for fid in file_ids:
-        hide = await ocr_should_hide(fid)
-        if not hide:
-            res.append(fid)
-    return res or (file_ids[:1])
-
-# ====== КОМАНДЫ ======
 @router.message(Command(commands=list(MODES.keys())))
 async def set_mode(msg: Message):
     user_id = msg.from_user.id
@@ -191,7 +234,6 @@ async def show_help(msg: Message):
 async def ping(msg: Message):
     await msg.answer("pong")
 
-# ====== ВСПОМОГ.: сборка подписи по режиму ======
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
     cleaned = cleanup_text_basic(caption)
     data = parse_input(cleaned)
@@ -203,7 +245,6 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
     final_price = calc_fn(price, data.get("discount", 0))
     return tpl_fn(final_price, data["retail"], data["sizes"], data["season"], mode_label=label)
 
-# ====== ХЕЛПЕР для ожидания текста ======
 async def _remember_media_for_text(chat_id: int, file_ids: List[str], mgid: Optional[str] = None, caption: str = ""):
     last_media[chat_id] = {
         "ts": datetime.now(),
@@ -212,9 +253,7 @@ async def _remember_media_for_text(chat_id: int, file_ids: List[str], mgid: Opti
         "mgid": mgid or "",
     }
 
-# ====== ХЕНДЛЕРЫ ======
-
-# 1) Одиночное фото
+# --- Хендлеры (оставлены как в твоём файле) ---
 @router.message(F.photo & (F.media_group_id == None))
 async def handle_single_photo(msg: Message):
     fid = msg.photo[-1].file_id
@@ -227,14 +266,12 @@ async def handle_single_photo(msg: Message):
             await publish_to_target(fids, result)
             return
 
-    # Цены нет — ждём текст
     await _remember_media_for_text(msg.chat.id, [fid], caption=caption)
     try:
         await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую одним постом.")
     except Exception:
         pass
 
-# 2) Альбом: собираем кадры; если подписи нет — ждём текст
 @router.message(F.photo & F.media_group_id)
 async def handle_album_photo(msg: Message):
     chat_id, mgid = msg.chat.id, str(msg.media_group_id)
@@ -267,7 +304,6 @@ async def handle_album_photo(msg: Message):
         caption = data["caption"]
         user_id = data["user_id"]
 
-        # порядок кадров
         items.sort(key=lambda x: x["mid"])
         idx_cap = next((i for i, it in enumerate(items) if it["cap"]), None)
         if idx_cap not in (None, 0):
@@ -283,7 +319,6 @@ async def handle_album_photo(msg: Message):
                 return
 
         await _remember_media_for_text(chat_id, file_ids, mgid=mgid, caption=caption)
-        # Подсказку шлём только если ещё нет свежего ожидания текста
         lm = last_media.get(chat_id)
         if not (lm and (datetime.now() - lm["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS))):
             try:
@@ -293,12 +328,10 @@ async def handle_album_photo(msg: Message):
 
     buf["task"] = asyncio.create_task(_flush_album())
 
-# 3) Текст под последними фото/альбомом (с правильным сопоставлением и защитой от гонки)
 @router.message(F.text)
 async def handle_text(msg: Message):
     chat_id, user_id = msg.chat.id, msg.from_user.id
 
-    # Вариант 1: уже есть сохранённые медиа
     bucket = last_media.get(chat_id)
     if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
         raw_text = (bucket.get("caption") or "")
@@ -317,7 +350,6 @@ async def handle_text(msg: Message):
         del last_media[chat_id]
         return
 
-    # Вариант 2: альбом ещё в буфере (гонка). Выберем тот, чей последний кадр <= id этого текста
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
@@ -331,7 +363,6 @@ async def handle_text(msg: Message):
             caption += "\n"
         caption += (msg.text or "")
 
-        # порядок кадров
         items.sort(key=lambda x: x["mid"])
         idx_cap = next((i for i, it in enumerate(items) if it["cap"]), None)
         if idx_cap not in (None, 0):
@@ -341,7 +372,6 @@ async def handle_text(msg: Message):
         result = build_result_text(user_id, caption)
         fids = await filter_pricetag_photos(file_ids)
 
-        # отменяем отложенный слив и убираем буфер
         if data.get("task"):
             data["task"].cancel()
         album_buffers.pop(key, None)
@@ -352,12 +382,13 @@ async def handle_text(msg: Message):
             await publish_to_target(fids, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
         return
 
-    # Вариант 3: ничего не нашли — игнор
     return
 
 # ====== ЗАПУСК ======
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
+    # запускаем воркер очереди перед polling
+    asyncio.create_task(publish_worker())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
