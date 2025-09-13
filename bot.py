@@ -1,6 +1,6 @@
 # bot.py — альбомы, 30+ режимов, OCR ценника, дебаунс 0.8с для альбомов,
 # подсказки при отсутствии цены и поддержка "альбом/фото → отдельный текст"
-# + Гарантия порядка публикаций через FIFO-очередь
+# + Гарантия порядка публикаций через FIFO-очередь + КНОПКА "Написать" с авто-пересылкой админу
 
 import os
 import re
@@ -10,10 +10,14 @@ from typing import Dict, Callable, Optional, List, Tuple
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, InputMediaPhoto
+from aiogram.types import (
+    Message, InputMediaPhoto,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
+from collections import defaultdict
 
 # ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -26,6 +30,16 @@ ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
 
+# ====== КОНТАКТ-КНОПКИ/ПЕРЕСЫЛКА ======
+# Ваши значения уже подставлены; при желании можете вынести в переменные окружения Render
+ADMIN_FORWARD_ID = int(os.getenv("ADMIN_FORWARD_ID", "1037914226"))     # ваш личный ID
+MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "julia_fashionshop")  # без @
+
+# item_id -> [message_id...]; item_id -> chat_id где лежит карточка
+ITEM_MESSAGES: Dict[str, List[int]] = defaultdict(list)
+ITEM_CHAT_ID: Dict[str, int] = {}
+_item_seq = 0  # счётчик для уникальных item_id
+
 # ====== ИНИЦИАЛИЗАЦИЯ ======
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -37,38 +51,95 @@ last_media: Dict[int, Dict] = {}             # {chat_id: {"ts", "file_ids", "cap
 active_mode: Dict[int, str] = {}             # {user_id: "mode"}
 album_buffers: Dict[Tuple[int, str], Dict] = {}  # {(chat_id, media_group_id): {"items", "caption", "task", "user_id"}}
 
-# ====== ОЧЕРЕДЬ ПУБЛИКАЦИЙ (FIFO) ======
-publish_queue: "asyncio.Queue[Tuple[List[str], str]]" = asyncio.Queue()
+# ====== КНОПКИ ======
+def get_contact_kb(item_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Написать", callback_data=f"contact_{item_id}")]
+    ])
 
-async def _do_publish(file_ids: List[str], caption: str):
+def get_open_chat_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Открыть чат с менеджером", url=f"https://t.me/{MANAGER_USERNAME}")]
+    ])
+
+@router.callback_query(F.data.startswith("contact_"))
+async def on_contact_click(cb: CallbackQuery):
+    item_id = cb.data.split("contact_", 1)[1]
+
+    # 1) Пересылаем админу ВСЕ сообщения карточки (альбом/фото + подпись)
+    try:
+        chat_src = ITEM_CHAT_ID.get(item_id, cb.message.chat.id)
+        mids = ITEM_MESSAGES.get(item_id, [cb.message.message_id])
+        for mid in mids:
+            await bot.forward_message(chat_id=ADMIN_FORWARD_ID, from_chat_id=chat_src, message_id=mid)
+    except Exception:
+        pass
+
+    # 2) Клиенту — кнопка открыть чат с вами
+    try:
+        await cb.message.answer(
+            "✅ Товар отправлен менеджеру. Нажмите ниже, чтобы сразу написать:",
+            reply_markup=get_open_chat_kb()
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+# ====== ОЧЕРЕДЬ ПУБЛИКАЦИЙ (FIFO) ======
+# Очередь хранит (file_ids, caption, item_id)
+publish_queue: "asyncio.Queue[Tuple[List[str], str, str]]" = asyncio.Queue()
+
+async def _do_publish(file_ids: List[str], caption: str, item_id: str):
     """Реальная отправка сообщений (не вызывать напрямую)."""
     if not file_ids:
         return
-    # ВАЖНО: OCR-фильтрация выполняется ЗДЕСЬ, внутри воркера,
-    # чтобы дольше обрабатывающиеся посты не обгоняли более быстрые.
+    # OCR-фильтрация выполняется здесь, чтобы порядок сохранялся
     fids = await filter_pricetag_photos(file_ids)
+
+    # Для ОДНОГО фото прикрепляем подпись и кнопку к самому фото.
+    # Для АЛЬБОМА — шлём медиагруппу без подписи, потом отдельным сообщением текст + кнопка.
     if len(fids) == 1:
-        await bot.send_photo(TARGET_CHAT_ID, fids[0], caption=caption)
+        msg = await bot.send_photo(
+            TARGET_CHAT_ID,
+            fids[0],
+            caption=caption,
+            reply_markup=get_contact_kb(item_id),
+        )
+        ITEM_MESSAGES[item_id].append(msg.message_id)
+        ITEM_CHAT_ID[item_id] = TARGET_CHAT_ID
     else:
-        media = [InputMediaPhoto(media=fids[0], caption=caption, parse_mode=ParseMode.HTML)]
-        media += [InputMediaPhoto(media=fid) for fid in fids[1:]]
-        await bot.send_media_group(TARGET_CHAT_ID, media)
+        sent = await bot.send_media_group(
+            TARGET_CHAT_ID,
+            [InputMediaPhoto(media=fids[0])] + [InputMediaPhoto(media=fid) for fid in fids[1:]]
+        )
+        for m in sent:
+            ITEM_MESSAGES[item_id].append(m.message_id)
+        ITEM_CHAT_ID[item_id] = TARGET_CHAT_ID
+
+        cap_msg = await bot.send_message(
+            TARGET_CHAT_ID,
+            caption,
+            reply_markup=get_contact_kb(item_id)
+        )
+        ITEM_MESSAGES[item_id].append(cap_msg.message_id)
 
 async def publish_worker():
     """Единственный воркер, публикует все задачи по очереди."""
     while True:
-        file_ids, caption = await publish_queue.get()
+        file_ids, caption, item_id = await publish_queue.get()
         try:
-            await _do_publish(file_ids, caption)
+            await _do_publish(file_ids, caption, item_id)
         except Exception:
-            # не блокируем очередь из-за ошибки одного сообщения
             pass
         finally:
             publish_queue.task_done()
 
 async def publish_to_target(file_ids: List[str], caption: str):
-    """Ставит публикацию в очередь (сохраняет порядок)."""
-    await publish_queue.put((file_ids, caption))
+    """Ставит публикацию в очередь (сохраняет порядок) + генерирует item_id."""
+    global _item_seq
+    _item_seq += 1
+    item_id = f"it{int(datetime.now().timestamp())}-{_item_seq}"
+    await publish_queue.put((file_ids, caption, item_id))
 
 # ====== OCR ======
 if OCR_ENABLED:
@@ -202,171 +273,4 @@ async def set_mode(msg: Message):
 @router.message(Command("help"))
 async def show_help(msg: Message):
     await msg.answer(
-        "Бот принимает фото/альбомы и текст с ценой.\n"
-        "• Фото/альбом без цены — ждём твой текст (до 30с).\n"
-        "• Если текст пришёл — публикуем одним постом."
-    )
-
-@router.message(Command("ping"))
-async def ping(msg: Message):
-    await msg.answer("pong")
-
-# ====== ВСПОМОГ.: сборка подписи по режиму ======
-def build_result_text(user_id: int, caption: str) -> Optional[str]:
-    cleaned = cleanup_text_basic(caption)
-    data = parse_input(cleaned)
-    price = data.get("price")
-    if price is None:
-        return None
-    mode = MODES.get(active_mode.get(user_id, "sale"), MODES["sale"])
-    calc_fn, tpl_fn, label = mode["calc"], mode["template"], mode["label"]
-    final_price = calc_fn(price, data.get("discount", 0))
-    return tpl_fn(final_price, data["retail"], data["sizes"], data["season"], mode_label=label)
-
-# ====== ХЕЛПЕР для ожидания текста ======
-async def _remember_media_for_text(chat_id: int, file_ids: List[str], mgid: Optional[str] = None, caption: str = ""):
-    last_media[chat_id] = {
-        "ts": datetime.now(),
-        "file_ids": file_ids,
-        "caption": caption or "",
-        "mgid": mgid or "",
-    }
-
-# ====== ХЕНДЛЕРЫ ======
-@router.message(F.photo & (F.media_group_id == None))
-async def handle_single_photo(msg: Message):
-    fid = msg.photo[-1].file_id
-    caption = (msg.caption or "").strip()
-
-    if caption:
-        result = build_result_text(msg.from_user.id, caption)
-        if result:
-            # В очередь без OCR — фильтрация выполнится в воркере
-            await publish_to_target([fid], result)
-            return
-
-    await _remember_media_for_text(msg.chat.id, [fid], caption=caption)
-    try:
-        await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую одним постом.")
-    except Exception:
-        pass
-
-@router.message(F.photo & F.media_group_id)
-async def handle_album_photo(msg: Message):
-    chat_id, mgid = msg.chat.id, str(msg.media_group_id)
-    key = (chat_id, mgid)
-
-    fid, mid = msg.photo[-1].file_id, msg.message_id
-    cap_text = (msg.caption or "").strip()
-    has_cap = bool(cap_text)
-
-    buf = album_buffers.get(key)
-    if not buf:
-        buf = {"items": [], "caption": "", "task": None, "user_id": msg.from_user.id}
-        album_buffers[key] = buf
-
-    buf["items"].append({"fid": fid, "mid": mid, "cap": has_cap})
-    if has_cap and not buf["caption"]:
-        buf["caption"] = cap_text
-
-    if buf["task"]:
-        buf["task"].cancel()
-
-    async def _flush_album():
-        await asyncio.sleep(ALBUM_SETTLE_MS / 1000)
-
-        data = album_buffers.pop(key, None)
-        if not data:
-            return
-
-        items = data["items"]
-        caption = data["caption"]
-        user_id = data["user_id"]
-
-        items.sort(key=lambda x: x["mid"])
-        idx_cap = next((i for i, it in enumerate(items) if it["cap"]), None)
-        if idx_cap not in (None, 0):
-            items.insert(0, items.pop(idx_cap))
-
-        file_ids = [it["fid"] for it in items]
-
-        if caption:
-            result = build_result_text(user_id, caption)
-            if result:
-                await publish_to_target(file_ids, result)
-                return
-
-        await _remember_media_for_text(chat_id, file_ids, mgid=mgid, caption=caption)
-        lm = last_media.get(chat_id)
-        if not (lm and (datetime.now() - lm["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS))):
-            try:
-                await bot.send_message(chat_id, "Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую альбом одним постом.")
-            except Exception:
-                pass
-
-    buf["task"] = asyncio.create_task(_flush_album())
-
-@router.message(F.text)
-async def handle_text(msg: Message):
-    chat_id, user_id = msg.chat.id, msg.from_user.id
-
-    bucket = last_media.get(chat_id)
-    if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
-        raw_text = (bucket.get("caption") or "")
-        if raw_text:
-            raw_text += "\n"
-        raw_text += (msg.text or "")
-
-        result = build_result_text(user_id, raw_text)
-        file_ids = bucket.get("file_ids") or []
-
-        if result:
-            await publish_to_target(file_ids, result)
-        else:
-            await publish_to_target(file_ids, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
-
-        del last_media[chat_id]
-        return
-
-    cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
-    if cand:
-        def last_mid(buf): return max(it["mid"] for it in buf["items"])
-        cand.sort(key=lambda kv: last_mid(kv[1]))
-        eligible = [kv for kv in cand if last_mid(kv[1]) <= msg.message_id]
-        key, data = (eligible[-1] if eligible else cand[-1])
-
-        items = data["items"]
-        caption = (data.get("caption") or "")
-        if caption:
-            caption += "\n"
-        caption += (msg.text or "")
-
-        items.sort(key=lambda x: x["mid"])
-        idx_cap = next((i for i, it in enumerate(items) if it["cap"]), None)
-        if idx_cap not in (None, 0):
-            items.insert(0, items.pop(idx_cap))
-
-        file_ids = [it["fid"] for it in items]
-        result = build_result_text(user_id, caption)
-
-        if data.get("task"):
-            data["task"].cancel()
-        album_buffers.pop(key, None)
-
-        if result:
-            await publish_to_target(file_ids, result)
-        else:
-            await publish_to_target(file_ids, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
-        return
-
-    return
-
-# ====== ЗАПУСК ======
-async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    # запускаем воркер очереди перед polling
-    asyncio.create_task(publish_worker())
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        "Бот принимает фото/альбомы и текст
