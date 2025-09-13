@@ -1,6 +1,7 @@
 # bot.py — альбомы, 30+ режимов, OCR ценника, дебаунс 0.8с для альбомов,
 # подсказки при отсутствии цены и поддержка "альбом/фото → отдельный текст"
-# + Гарантия порядка публикаций через FIFO-очередь + КНОПКА "Написать" с авто-пересылкой админу
+# + Гарантия порядка публикаций через FIFO-очередь
+# + ТОЛЬКО текстовая ссылка «Написать» (без кнопок) с deep-link к боту: пересылка карточки админу + ответ клиенту
 
 import os
 import re
@@ -10,10 +11,7 @@ from typing import Dict, Callable, Optional, List, Tuple
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import (
-    Message, InputMediaPhoto,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-)
+from aiogram.types import Message, InputMediaPhoto
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
@@ -30,10 +28,10 @@ ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
 
-# ====== КОНТАКТ-КНОПКИ/ПЕРЕСЫЛКА ======
-# Ваши значения уже подставлены; при желании можете вынести в переменные окружения Render
+# ====== КОНТАКТЫ ======
 ADMIN_FORWARD_ID = int(os.getenv("ADMIN_FORWARD_ID", "1037914226"))     # ваш личный ID
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "julia_fashionshop")  # без @
+BOT_USERNAME = os.getenv("BOT_USERNAME", "fashionshop_lux_bot")        # БЕЗ @ — имя вашего бота
 
 # item_id -> [message_id...]; item_id -> chat_id где лежит карточка
 ITEM_MESSAGES: Dict[str, List[int]] = defaultdict(list)
@@ -51,128 +49,14 @@ last_media: Dict[int, Dict] = {}             # {chat_id: {"ts", "file_ids", "cap
 active_mode: Dict[int, str] = {}             # {user_id: "mode"}
 album_buffers: Dict[Tuple[int, str], Dict] = {}  # {(chat_id, media_group_id): {"items", "caption", "task", "user_id"}}
 
-# ====== КНОПКИ ======
-def get_contact_kb(item_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✍️ Написать", callback_data=f"contact_{item_id}")]
-    ])
+# ====== ССЫЛКИ ======
+def deep_link(item_id: str) -> str:
+    """Ссылка «Написать», ведущая к боту с payload=item_id (запускает /start item_id)."""
+    return f'<a href="https://t.me/{BOT_USERNAME}?start={item_id}">Написать</a>'
 
-def get_open_chat_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Открыть чат с менеджером", url=f"https://t.me/{MANAGER_USERNAME}")]
-    ])
-
-@router.callback_query(F.data.startswith("contact_"))
-async def on_contact_click(cb: CallbackQuery):
-    item_id = cb.data.split("contact_", 1)[1]
-
-    # 1) Пересылаем админу ВСЕ сообщения карточки (альбом/фото + подпись)
-    try:
-        chat_src = ITEM_CHAT_ID.get(item_id, cb.message.chat.id)
-        mids = ITEM_MESSAGES.get(item_id, [cb.message.message_id])
-        for mid in mids:
-            await bot.forward_message(chat_id=ADMIN_FORWARD_ID, from_chat_id=chat_src, message_id=mid)
-    except Exception:
-        pass
-
-    # 2) Клиенту — кнопка открыть чат с вами
-    try:
-        await cb.message.answer(
-            "✅ Товар отправлен менеджеру. Нажмите ниже, чтобы сразу написать:",
-            reply_markup=get_open_chat_kb()
-        )
-    except Exception:
-        pass
-    await cb.answer()
-
-# ====== ОЧЕРЕДЬ ПУБЛИКАЦИЙ (FIFO) ======
-# Очередь хранит (file_ids, caption, item_id)
-publish_queue: "asyncio.Queue[Tuple[List[str], str, str]]" = asyncio.Queue()
-
-async def _do_publish(file_ids: List[str], caption: str, item_id: str):
-    """Реальная отправка сообщений (не вызывать напрямую)."""
-    if not file_ids:
-        return
-    # OCR-фильтрация выполняется здесь, чтобы порядок сохранялся
-    fids = await filter_pricetag_photos(file_ids)
-
-    # Для ОДНОГО фото прикрепляем подпись и кнопку к самому фото.
-    # Для АЛЬБОМА — шлём медиагруппу без подписи, потом отдельным сообщением текст + кнопка.
-    if len(fids) == 1:
-        msg = await bot.send_photo(
-            TARGET_CHAT_ID,
-            fids[0],
-            caption=caption,
-            reply_markup=get_contact_kb(item_id),
-        )
-        ITEM_MESSAGES[item_id].append(msg.message_id)
-        ITEM_CHAT_ID[item_id] = TARGET_CHAT_ID
-    else:
-        sent = await bot.send_media_group(
-            TARGET_CHAT_ID,
-            [InputMediaPhoto(media=fids[0])] + [InputMediaPhoto(media=fid) for fid in fids[1:]]
-        )
-        for m in sent:
-            ITEM_MESSAGES[item_id].append(m.message_id)
-        ITEM_CHAT_ID[item_id] = TARGET_CHAT_ID
-
-        cap_msg = await bot.send_message(
-            TARGET_CHAT_ID,
-            caption,
-            reply_markup=get_contact_kb(item_id)
-        )
-        ITEM_MESSAGES[item_id].append(cap_msg.message_id)
-
-async def publish_worker():
-    """Единственный воркер, публикует все задачи по очереди."""
-    while True:
-        file_ids, caption, item_id = await publish_queue.get()
-        try:
-            await _do_publish(file_ids, caption, item_id)
-        except Exception:
-            pass
-        finally:
-            publish_queue.task_done()
-
-async def publish_to_target(file_ids: List[str], caption: str):
-    """Ставит публикацию в очередь (сохраняет порядок) + генерирует item_id."""
-    global _item_seq
-    _item_seq += 1
-    item_id = f"it{int(datetime.now().timestamp())}-{_item_seq}"
-    await publish_queue.put((file_ids, caption, item_id))
-
-# ====== OCR ======
-if OCR_ENABLED:
-    try:
-        import pytesseract
-        from PIL import Image
-    except Exception:
-        OCR_ENABLED = False
-
-async def ocr_should_hide(file_id: str) -> bool:
-    if not OCR_ENABLED:
-        return False
-    try:
-        file = await bot.get_file(file_id)
-        buf = io.BytesIO()
-        await bot.download(file, buf)
-        buf.seek(0)
-        img = Image.open(buf)
-        txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
-        tl = txt.lower()
-        has_euro = "€" in txt or "eur" in tl
-        has_word = any(w in tl for w in ("prezzo", "price", "retail"))
-        return bool(has_euro and has_word)
-    except Exception:
-        return False
-
-async def filter_pricetag_photos(file_ids: List[str]) -> List[str]:
-    res: List[str] = []
-    for fid in file_ids:
-        hide = await ocr_should_hide(fid)
-        if not hide:
-            res.append(fid)
-    return res or (file_ids[:1])
+def manager_link() -> str:
+    """Прямая ссылка на менеджера (Юлия)."""
+    return f'<a href="https://t.me/{MANAGER_USERNAME}">@{MANAGER_USERNAME}</a>'
 
 # ====== ВСПОМОГАТЕЛЬНОЕ ======
 def round_price(value: float) -> int:
@@ -275,10 +159,12 @@ async def show_help(msg: Message):
     await msg.answer(
         "Бот принимает фото/альбомы и текст с ценой.\n"
         "• Фото/альбом без цены — ждём твой текст (до 30 с).\n"
-        "• Если текст пришёл — публикуем одним постом."
+        "• Если текст пришёл — публикуем одним постом.\n"
+        "В конце подписи добавляется ссылка «Написать» (только текст). "
+        "По клику бот отправит выбранный товар менеджеру и пришлёт вам ссылку на @julia_fashionshop."
     )
 
-# ====== ВСПОМОГ.: сборка подписи по режиму ======
+# ====== СБОРКА ПОДПИСИ ПО РЕЖИМУ ======
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
     cleaned = cleanup_text_basic(caption)
     data = parse_input(cleaned)
@@ -290,6 +176,97 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
     final_price = calc_fn(price, data.get("discount", 0))
     return tpl_fn(final_price, data["retail"], data["sizes"], data["season"], mode_label=label)
 
+# ====== ОЧЕРЕДЬ ПУБЛИКАЦИЙ (FIFO) ======
+# Очередь хранит (file_ids, caption, item_id)
+publish_queue: "asyncio.Queue[Tuple[List[str], str, str]]" = asyncio.Queue()
+
+async def _do_publish(file_ids: List[str], caption: str, item_id: str):
+    """Реальная отправка сообщений (не вызывать напрямую)."""
+    if not file_ids:
+        return
+    # OCR-фильтрация выполняется здесь, чтобы порядок сохранялся
+    fids = await filter_pricetag_photos(file_ids)
+
+    # ТОЛЬКО текстовая ссылка «Написать» (deep-link) в конец подписи
+    caption_with_link = (caption + ("\n" if caption else "") + deep_link(item_id)).strip()
+
+    # Для ОДНОГО фото — подпись, БЕЗ кнопок
+    if len(fids) == 1:
+        msg = await bot.send_photo(
+            TARGET_CHAT_ID,
+            fids[0],
+            caption=caption_with_link
+        )
+        ITEM_MESSAGES[item_id].append(msg.message_id)
+        ITEM_CHAT_ID[item_id] = TARGET_CHAT_ID
+    else:
+        # Для АЛЬБОМА: сначала медиагруппа без подписи
+        sent = await bot.send_media_group(
+            TARGET_CHAT_ID,
+            [InputMediaPhoto(media=fids[0])] + [InputMediaPhoto(media=fid) for fid in fids[1:]]
+        )
+        for m in sent:
+            ITEM_MESSAGES[item_id].append(m.message_id)
+        ITEM_CHAT_ID[item_id] = TARGET_CHAT_ID
+
+        # Затем отдельным сообщением подпись (без кнопок)
+        cap_msg = await bot.send_message(
+            TARGET_CHAT_ID,
+            caption_with_link
+        )
+        ITEM_MESSAGES[item_id].append(cap_msg.message_id)
+
+async def publish_worker():
+    """Единственный воркер, публикует все задачи по очереди."""
+    while True:
+        file_ids, caption, item_id = await publish_queue.get()
+        try:
+            await _do_publish(file_ids, caption, item_id)
+        except Exception:
+            pass
+        finally:
+            publish_queue.task_done()
+
+async def publish_to_target(file_ids: List[str], caption: str):
+    """Ставит публикацию в очередь (сохраняет порядок) + генерирует item_id."""
+    global _item_seq
+    _item_seq += 1
+    item_id = f"it{int(datetime.now().timestamp())}-{_item_seq}"
+    await publish_queue.put((file_ids, caption, item_id))
+
+# ====== OCR ======
+if OCR_ENABLED:
+    try:
+        import pytesseract
+        from PIL import Image
+    except Exception:
+        OCR_ENABLED = False
+
+async def ocr_should_hide(file_id: str) -> bool:
+    if not OCR_ENABLED:
+        return False
+    try:
+        file = await bot.get_file(file_id)
+        buf = io.BytesIO()
+        await bot.download(file, buf)
+        buf.seek(0)
+        img = Image.open(buf)
+        txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
+        tl = txt.lower()
+        has_euro = "€" in txt or "eur" in tl
+        has_word = any(w in tl for w in ("prezzo", "price", "retail"))
+        return bool(has_euro and has_word)
+    except Exception:
+        return False
+
+async def filter_pricetag_photos(file_ids: List[str]) -> List[str]:
+    res: List[str] = []
+    for fid in file_ids:
+        hide = await ocr_should_hide(fid)
+        if not hide:
+            res.append(fid)
+    return res or (file_ids[:1])
+
 # ====== ХЕЛПЕР: запомнить медиа и ждать текст ======
 async def _remember_media_for_text(chat_id: int, file_ids: List[str], mgid: Optional[str] = None, caption: str = ""):
     last_media[chat_id] = {
@@ -299,7 +276,7 @@ async def _remember_media_for_text(chat_id: int, file_ids: List[str], mgid: Opti
         "mgid": mgid or "",
     }
 
-# ====== ХЕНДЛЕРЫ ======
+# ====== ХЕНДЛЕРЫ КОНТЕНТА ======
 @router.message(F.photo & (F.media_group_id == None))
 async def handle_single_photo(msg: Message):
     fid = msg.photo[-1].file_id
@@ -308,7 +285,7 @@ async def handle_single_photo(msg: Message):
     if caption:
         result = build_result_text(msg.from_user.id, caption)
         if result:
-            # Ставим публикацию в очередь — кнопка прикрепится автоматически
+            # Ставим публикацию в очередь — в подпись добавится «Написать»
             await publish_to_target([fid], result)
             return
 
@@ -436,7 +413,42 @@ async def handle_text(msg: Message):
     # обычный текст — игнорируем
     return
 
-# ====== ЗАПУСК ======
+# ====== ОБРАБОТКА DEEP-LINK /start <item_id> ======
+@router.message(F.text.startswith("/start"))
+async def start_with_payload(msg: Message):
+    parts = (msg.text or "").split(maxsplit=1)
+    payload = parts[1] if len(parts) > 1 else ""
+    if not payload:
+        return await msg.answer("Здравствуйте! Напишите ваш запрос, пожалуйста.")
+
+    item_id = payload.strip()
+
+    # 1) Пересылаем админу все сообщения карточки
+    try:
+        chat_src = ITEM_CHAT_ID.get(item_id)
+        mids = ITEM_MESSAGES.get(item_id, [])
+        if chat_src and mids:
+            for mid in mids:
+                await bot.forward_message(
+                    chat_id=ADMIN_FORWARD_ID,
+                    from_chat_id=chat_src,
+                    message_id=mid
+                )
+        else:
+            await bot.send_message(ADMIN_FORWARD_ID, f"Клиент открыл карточку {item_id}, но сообщения не найдены.")
+    except Exception:
+        pass
+
+    # 2) Ответ клиенту: ссылка на менеджера
+    try:
+        await msg.answer(
+            "✅ Товар отправлен менеджеру.\n"
+            f"Откройте чат с менеджером: {manager_link()}",
+        )
+    except Exception:
+        pass
+
+# ====== ЗАПУСК ОЧЕРЕДИ И ПОЛЛИНГ ======
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     # запускаем воркер очереди перед polling
