@@ -45,21 +45,15 @@ last_media: Dict[int, Dict[str, Any]] = {}
 active_mode: Dict[int, str] = {}
 album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
-# ====== SEQ + ОЧЕРЕДЬ ПУБЛИКАЦИЙ (STRICT FIFO по seq) ======
-_next_seq = 0
-def alloc_seq() -> int:
-    global _next_seq
-    _next_seq += 1
-    return _next_seq
-
-# Очередь приоритета по seq: (seq, user_id, items, caption, album_ocr_on)
+# ====== ОЧЕРЕДЬ ПУБЛИКАЦИЙ (STRICT FIFO по seq = Telegram message_id) ======
+# Элемент очереди: (seq, user_id, items, caption, album_ocr_on)
 publish_queue: "asyncio.PriorityQueue[Tuple[int, int, List[Dict[str, Any]], str, bool]]" = asyncio.PriorityQueue()
 
 def is_ocr_enabled_for(user_id: int) -> bool:
     """
     /lux      -> OCR off для альбомов
     /luxocr   -> OCR on  для альбомов
-    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALБOMS
+    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALBUMS
     """
     mode = active_mode.get(user_id, "sale")
     if mode == "lux":
@@ -428,14 +422,15 @@ async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[
         "caption": caption or "",
         "mgid": mgid or "",
         "user_id": user_id,
-        "seq": seq if seq is not None else alloc_seq(),
+        # seq = message_id первого медиа (если не передали явно)
+        "seq": seq if seq is not None else (items[0]["mid"] if items else int(datetime.now().timestamp())),
     }
 
 # ====== ХЕНДЛЕРЫ ======
 # Одиночное фото
 @router.message(F.photo & (F.media_group_id == None))
 async def handle_single_photo(msg: Message):
-    seq = alloc_seq()
+    seq = msg.message_id  # порядок = как пришло в Telegram
     item = {"kind": "photo", "fid": msg.photo[-1].file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
     if caption:
@@ -452,7 +447,7 @@ async def handle_single_photo(msg: Message):
 # Одиночное видео
 @router.message(F.video & (F.media_group_id == None))
 async def handle_single_video(msg: Message):
-    seq = alloc_seq()
+    seq = msg.message_id
     item = {"kind": "video", "fid": msg.video.file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
     if caption:
@@ -487,7 +482,8 @@ async def handle_album_any(msg: Message):
 
     buf = album_buffers.get(key)
     if not buf:
-        buf = {"items": [], "caption": "", "task": None, "user_id": msg.from_user.id, "seq": alloc_seq()}
+        # seq задаём по первому сообщению альбома (его message_id)
+        buf = {"items": [], "caption": "", "task": None, "user_id": msg.from_user.id, "seq": msg.message_id}
         album_buffers[key] = buf
 
     buf["items"].append({"kind": kind, "fid": fid, "mid": msg.message_id, "cap": has_cap})
@@ -495,7 +491,10 @@ async def handle_album_any(msg: Message):
         buf["caption"] = cap_text
 
     if buf["task"]:
-        buf["task"].cancel()
+        try:
+            buf["task"].cancel()
+        except Exception:
+            pass
 
     async def _flush_album():
         await asyncio.sleep(ALBUM_SETTLE_MS / 1000)
@@ -539,7 +538,7 @@ async def handle_text(msg: Message):
     # Текст к одиночному медиа
     if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
         user_id = bucket.get("user_id") or msg.from_user.id
-        seq = bucket.get("seq", alloc_seq())
+        seq = bucket.get("seq", msg.message_id)
         raw_text = (bucket.get("caption") or "")
         if raw_text:
             raw_text += "\n"
@@ -576,11 +575,14 @@ async def handle_text(msg: Message):
             items.insert(0, items.pop(idx_cap))
 
         user_id = data.get("user_id") or msg.from_user.id
-        seq = data.get("seq", alloc_seq())
+        seq = data.get("seq", msg.message_id)
         result = build_result_text(user_id, caption)
 
         if data.get("task"):
-            data["task"].cancel()
+            try:
+                data["task"].cancel()
+            except Exception:
+                pass
         album_buffers.pop(key, None)
 
         if result:
