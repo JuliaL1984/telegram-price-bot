@@ -25,6 +25,8 @@ ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
+# В альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
+FILTER_PRICETAGS_IN_ALBUMS = os.getenv("FILTER_PRICETAGS_IN_ALBUMS", "1") == "1"
 
 # ====== ИНИЦИАЛИЗАЦИЯ ======
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -46,7 +48,7 @@ async def _do_publish(items: List[Dict[str, Any]], caption: str):
     if not items:
         return
 
-    # OCR-фильтрация только для фото, видео не режем
+    # OCR-фильтрация (логика различается для альбомов и одиночных)
     items = await filter_pricetag_media(items)
 
     if len(items) == 1:
@@ -96,7 +98,7 @@ if OCR_ENABLED:
         OCR_ENABLED = False
 
 async def ocr_should_hide(file_id: str) -> bool:
-    """Прятать ли фото-ценник (видео не трогаем)."""
+    """Строгий детектор ценника для фото."""
     if not OCR_ENABLED:
         return False
     try:
@@ -104,26 +106,45 @@ async def ocr_should_hide(file_id: str) -> bool:
         buf = io.BytesIO()
         await bot.download(file, buf)
         buf.seek(0)
+        from PIL import Image
+        import pytesseract
         img = Image.open(buf)
         txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
         tl = txt.lower()
-        has_euro = "€" in txt or "eur" in tl
-        has_word = any(w in tl for w in ("prezzo", "price", "retail"))
-        return bool(has_euro and has_word)
+
+        # Признаки ценника: валюта + «длинное» число + (скидка % или слово price/prezzo/retail)
+        has_euro = ("€" in txt) or (" eur" in tl) or ("eur " in tl)
+        has_kw   = ("retail price" in tl) or ("prezzo" in tl) or (" price" in tl)
+        has_pct  = "%" in txt
+        long_num = bool(re.search(r"\b\d{3,5}\b", txt))  # 750, 1900, 12500 и т.п.
+
+        return bool(has_euro and long_num and (has_pct or has_kw))
     except Exception:
         return False
 
 async def filter_pricetag_media(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Убираем фото-ценники, видео оставляем всегда."""
-    res: List[Dict[str, Any]] = []
+    """
+    Одиночные: ничего не удаляем (чтобы не пропустить пост).
+    Альбомы: при FILTER_PRICETAGS_IN_ALBUMS=1 — вырезаем ТОЛЬКО кадры-ценники (видео никогда не режем).
+    Порядок сохраняем. Если всё вырезалось — оставим первый исходный, чтобы не «съесть» публикацию.
+    """
+    # Одиночный файл — не трогаем
+    if len(items) == 1:
+        return items
+
+    # Альбом
+    if not FILTER_PRICETAGS_IN_ALBUMS:
+        return items
+
+    kept: List[Dict[str, Any]] = []
     for it in items:
         if it["kind"] == "photo":
-            hide = await ocr_should_hide(it["fid"])
-            if not hide:
-                res.append(it)
+            if not await ocr_should_hide(it["fid"]):
+                kept.append(it)
         else:
-            res.append(it)
-    return res or items[:1]
+            kept.append(it)  # видео всегда оставляем
+
+    return kept or items[:1]
 
 # ====== ВСПОМОГАТЕЛЬНОЕ ======
 def round_price(value: float) -> int:
@@ -241,7 +262,7 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
     mode = MODES.get(active_mode.get(user_id, "sale"), MODES["sale"])
     calc_fn, tpl_fn, _label = mode["calc"], mode["template"], mode["label"]
     final_price = calc_fn(price, data.get("discount", 0))
-    # Не передаем mode_label — никаких меток в постах
+    # Не передаём mode_label — никаких меток в постах
     return tpl_fn(final_price, data["retail"], data["sizes"], data["season"], mode_label=None)
 
 # ====== ХЕЛПЕРЫ ======
