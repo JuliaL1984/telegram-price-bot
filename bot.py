@@ -1,7 +1,8 @@
 # bot.py — альбомы, 30+ режимов, OCR ценника, дебаунс 1.5с для альбомов,
 # подсказки при отсутствии цены и поддержка "альбом/фото/видео → общий текст"
 # + Гарантия порядка публикаций через FIFO-очередь
-# Версия с 5-строчной подписью и точным парсингом размеров/сезона/бренда
+# Версия с 5-строчной подписью, точным парсингом размеров/сезона/бренда
+# и двумя режимами: /lux (OCR off) и /luxocr (OCR on), одинаковая формула.
 
 import os
 import re
@@ -26,7 +27,7 @@ ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
-# В альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
+# Базовая политика: в альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
 FILTER_PRICETAGS_IN_ALBUMS = os.getenv("FILTER_PRICETAGS_IN_ALBUMS", "1") == "1"
 
 # ====== ИНИЦИАЛИЗАЦИЯ ======
@@ -42,15 +43,29 @@ active_mode: Dict[int, str] = {}
 album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
 # ====== ОЧЕРЕДЬ ПУБЛИКАЦИЙ (FIFO) ======
-publish_queue: "asyncio.Queue[Tuple[List[Dict[str, Any]], str]]" = asyncio.Queue()
+# Очередь теперь содержит: (user_id, items, caption, album_ocr_on)
+publish_queue: "asyncio.Queue[Tuple[int, List[Dict[str, Any]], str, bool]]" = asyncio.Queue()
 
-async def _do_publish(items: List[Dict[str, Any]], caption: str):
+def is_ocr_enabled_for(user_id: int) -> bool:
+    """
+    /lux      -> OCR off в альбомах (ничего не вырезаем)
+    /luxocr   -> OCR on  в альбомах (ценники удаляем по строгим правилам)
+    все прочие режимы -> по глобальной настройке FILTER_PRICETAGS_IN_ALBUMS
+    """
+    mode = active_mode.get(user_id, "sale")
+    if mode == "lux":
+        return False
+    if mode == "luxocr":
+        return True
+    return FILTER_PRICETAGS_IN_ALBUMS
+
+async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, album_ocr_on: bool):
     """Реальная отправка сообщений (фото/видео/альбомы)."""
     if not items:
         return
 
-    # OCR-фильтрация (логика различается для альбомов и одиночных)
-    items = await filter_pricetag_media(items)
+    # OCR-фильтрация только для альбомов при album_ocr_on=True
+    items = await filter_pricetag_media(items, album_ocr_on)
 
     if len(items) == 1:
         it = items[0]
@@ -78,16 +93,18 @@ async def _do_publish(items: List[Dict[str, Any]], caption: str):
 
 async def publish_worker():
     while True:
-        items, caption = await publish_queue.get()
+        user_id, items, caption, album_ocr_on = await publish_queue.get()
         try:
-            await _do_publish(items, caption)
+            await _do_publish(user_id, items, caption, album_ocr_on)
         except Exception:
-            pass  # не блокируем очередь из-за ошибки одного сообщения
+            # не блокируем очередь из-за ошибки одного сообщения
+            pass
         finally:
             publish_queue.task_done()
 
-async def publish_to_target(items: List[Dict[str, Any]], caption: str):
-    await publish_queue.put((items, caption))
+async def publish_to_target(user_id: int, items: List[Dict[str, Any]], caption: str):
+    album_ocr_on = is_ocr_enabled_for(user_id)
+    await publish_queue.put((user_id, items, caption, album_ocr_on))
 
 # ====== OCR ======
 if OCR_ENABLED:
@@ -127,13 +144,13 @@ async def ocr_should_hide(file_id: str) -> bool:
     except Exception:
         return False
 
-async def filter_pricetag_media(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool) -> List[Dict[str, Any]]:
     """
     Одиночные: ничего не удаляем.
-    Альбомы: при FILTER_PRICETAGS_IN_ALBUMS=1 — вырезаем ТОЛЬКО кадры-ценники (видео никогда не режем).
+    Альбомы: при album_ocr_on=True — вырезаем ТОЛЬКО кадры-ценники (видео никогда не режем).
     Если всё вырезалось — оставляем первый исходный, чтобы не «съесть» публикацию.
     """
-    if len(items) == 1 or not FILTER_PRICETAGS_IN_ALBUMS:
+    if len(items) == 1 or not album_ocr_on:
         return items
 
     kept: List[Dict[str, Any]] = []
@@ -151,6 +168,9 @@ def round_price(value: float) -> int:
     return int(round(value, 0))
 
 def default_calc(price: float, discount: int) -> int:
+    """
+    Базовый калькулятор (для остальных режимов).
+    """
     discounted = price * (1 - discount / 100)
     if discounted <= 250:
         return round_price(discounted + 55)
@@ -158,6 +178,23 @@ def default_calc(price: float, discount: int) -> int:
         return round_price(discounted + 70)
     else:
         return round_price(discounted + 90)
+
+def lux_calc(price: float, discount: int) -> int:
+    """
+    Калькулятор для /lux и /luxocr:
+    - Берём исходную цену и '-XX%' из текста => discounted.
+    - Если discounted ≤ 250€: +55€
+      Если 251–400€: +70€
+      Если > 400€: +10% и +30€  (discounted * 1.10 + 30)
+    """
+    discounted = price * (1 - discount / 100)
+    if discounted <= 250:
+        final = discounted + 55
+    elif discounted <= 400:
+        final = discounted + 70
+    else:
+        final = discounted * 1.10 + 30
+    return round_price(final)
 
 # ====== РАЗБОР И ФОРМИРОВАНИЕ 5-СТРОЧНОЙ ПОДПИСИ ======
 
@@ -345,9 +382,11 @@ def mk_mode(label: str,
             template: Callable[[int, float, str, str, str], str] = template_five_lines):
     return {"label": label, "calc": calc, "template": template}
 
+# ====== РЕЖИМЫ ======
 MODES: Dict[str, Dict] = {
     "sale": mk_mode("SALE"),
-    "lux": mk_mode("LUX"),
+    "lux": mk_mode("LUX", calc=lux_calc),          # OCR off
+    "luxocr": mk_mode("LUX OCR", calc=lux_calc),   # OCR on
     "outlet": mk_mode("OUTLET"),
     "stock": mk_mode("STOCK"),
     "newfw": mk_mode("NEW FW"),
@@ -396,7 +435,9 @@ async def set_mode(msg: Message):
 async def show_help(msg: Message):
     await msg.answer(
         "Бот принимает фото/видео (в т.ч. альбомы) и текст с ценой.\n"
-        "• Без цены — ждём твой текст (до 30с) и публикуем единым постом."
+        "• Без цены — ждём твой текст (до 30с) и публикуем единым постом.\n"
+        "• Режимы /lux (OCR off) и /luxocr (OCR on) используют формулу: после скидки\n"
+        "  ≤250€ +55€; 251–400€ +70€; >400€ → +10% и +30€."
     )
 
 @router.message(Command("ping"))
@@ -421,12 +462,13 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
     )
 
 # ====== ХЕЛПЕРЫ ======
-async def _remember_media_for_text(chat_id: int, items: List[Dict[str, Any]], mgid: Optional[str] = None, caption: str = ""):
+async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[str, Any]], mgid: Optional[str] = None, caption: str = ""):
     last_media[chat_id] = {
         "ts": datetime.now(),
         "items": items,
         "caption": caption or "",
         "mgid": mgid or "",
+        "user_id": user_id,
     }
 
 # ====== ХЕНДЛЕРЫ ======
@@ -438,9 +480,9 @@ async def handle_single_photo(msg: Message):
     if caption:
         result = build_result_text(msg.from_user.id, caption)
         if result:
-            await publish_to_target([item], result)
+            await publish_to_target(msg.from_user.id, [item], result)
             return
-    await _remember_media_for_text(msg.chat.id, [item], caption=caption)
+    await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], caption=caption)
     try:
         await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую одним постом.")
     except Exception:
@@ -454,9 +496,9 @@ async def handle_single_video(msg: Message):
     if caption:
         result = build_result_text(msg.from_user.id, caption)
         if result:
-            await publish_to_target([item], result)
+            await publish_to_target(msg.from_user.id, [item], result)
             return
-    await _remember_media_for_text(msg.chat.id, [item], caption=caption)
+    await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], caption=caption)
     try:
         await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую одним постом.")
     except Exception:
@@ -513,10 +555,10 @@ async def handle_album_any(msg: Message):
         if caption:
             result = build_result_text(user_id, caption)
             if result:
-                await publish_to_target(items, result)
+                await publish_to_target(user_id, items, result)
                 return
 
-        await _remember_media_for_text(chat_id, items, mgid=mgid, caption=caption)
+        await _remember_media_for_text(chat_id, user_id, items, mgid=mgid, caption=caption)
         lm = last_media.get(chat_id)
         if not (lm and (datetime.now() - lm["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS))):
             try:
@@ -526,12 +568,14 @@ async def handle_album_any(msg: Message):
 
     buf["task"] = asyncio.create_task(_flush_album())
 
+# Текст после медиа/альбома
 @router.message(F.text)
 async def handle_text(msg: Message):
-    chat_id, user_id = msg.chat.id, msg.from_user.id
+    chat_id = msg.chat.id
     bucket = last_media.get(chat_id)
 
     if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
+        user_id = bucket.get("user_id") or msg.from_user.id
         raw_text = (bucket.get("caption") or "")
         if raw_text:
             raw_text += "\n"
@@ -541,14 +585,14 @@ async def handle_text(msg: Message):
         items: List[Dict[str, Any]] = bucket.get("items") or []
 
         if result:
-            await publish_to_target(items, result)
+            await publish_to_target(user_id, items, result)
         else:
-            await publish_to_target(items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
+            await publish_to_target(user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
 
         del last_media[chat_id]
         return
 
-    # Текст после альбома
+    # Текст после ещё не закрытого альбома
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
@@ -567,6 +611,7 @@ async def handle_text(msg: Message):
         if idx_cap not in (None, 0):
             items.insert(0, items.pop(idx_cap))
 
+        user_id = data.get("user_id") or msg.from_user.id
         result = build_result_text(user_id, caption)
 
         if data.get("task"):
@@ -574,9 +619,9 @@ async def handle_text(msg: Message):
         album_buffers.pop(key, None)
 
         if result:
-            await publish_to_target(items, result)
+            await publish_to_target(user_id, items, result)
         else:
-            await publish_to_target(items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
+            await publish_to_target(user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
         return
 
     return
