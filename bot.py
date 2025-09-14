@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, InputMediaPhoto, InputMediaVideo
-from aiogram.enums import ParseMode, MessageEntityType  # <-- добавлено MessageEntityType
+from aiogram.enums import ParseMode, MessageEntityType
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 
@@ -313,7 +313,7 @@ def pick_season_line(lines: List[str]) -> str:
         if re.search(r"\bNEW\s+(?:FW|SS)\d+(?:/\d+)?\b", line, flags=re.I):
             return line.strip()
     for line in lines:
-        if re.search(r"\b(?:FW|SS)\d+(?:/\д+)?\b", line, flags=re.I):
+        if re.search(r"\b(?:FW|SS)\d+(?:/\d+)?\b", line, flags=re.I):
             return line.strip()
     return ""
 
@@ -328,7 +328,7 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
 
     price_m    = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
     discount_m = re.search(r"-(\d+)%", text)
-    retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\д{3})*)", text, flags=re.I)
+    retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
 
     price    = parse_number_token(price_m.group(1)) if price_m else None
     discount = int(discount_m.group(1)) if discount_m else 0
