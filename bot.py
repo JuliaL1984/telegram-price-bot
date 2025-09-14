@@ -1,12 +1,14 @@
 # bot.py — альбомы, 30+ режимов, OCR ценника, дебаунс 1.5с для альбомов,
 # подсказки при отсутствии цены и поддержка "альбом/фото/видео → общий текст"
 # + Гарантия порядка публикаций через FIFO-очередь
-# Версия с 5-строчной подписью, точным парсингом размеров/сезона/бренда
+# Версия с 5-строчной подписью, точным парсингом размеров/сезона,
 # и двумя режимами: /lux (OCR off) и /luxocr (OCR on), одинаковая формула.
+# Округление всегда вверх; бренд из подписи удалён.
 
 import os
 import re
 import io
+import math
 import asyncio
 from typing import Dict, Callable, Optional, List, Tuple, Any
 from datetime import datetime, timedelta
@@ -43,14 +45,14 @@ active_mode: Dict[int, str] = {}
 album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
 # ====== ОЧЕРЕДЬ ПУБЛИКАЦИЙ (FIFO) ======
-# Очередь теперь содержит: (user_id, items, caption, album_ocr_on)
+# Очередь: (user_id, items, caption, album_ocr_on)
 publish_queue: "asyncio.Queue[Tuple[int, List[Dict[str, Any]], str, bool]]" = asyncio.Queue()
 
 def is_ocr_enabled_for(user_id: int) -> bool:
     """
-    /lux      -> OCR off в альбомах (ничего не вырезаем)
-    /luxocr   -> OCR on  в альбомах (ценники удаляем по строгим правилам)
-    все прочие режимы -> по глобальной настройке FILTER_PRICETAGS_IN_ALBUMS
+    /lux      -> OCR off для альбомов
+    /luxocr   -> OCR on  для альбомов
+    остальное -> глобальная FILTER_PRICETAGS_IN_ALBUMS
     """
     mode = active_mode.get(user_id, "sale")
     if mode == "lux":
@@ -75,7 +77,7 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
             await bot.send_photo(TARGET_CHAT_ID, it["fid"], caption=caption)
         return
 
-    # Альбом: подпись ставим к первому элементу (фото или видео)
+    # Альбом: подпись ставим к первому элементу
     first = items[0]
     media = []
     if first["kind"] == "video":
@@ -97,7 +99,6 @@ async def publish_worker():
         try:
             await _do_publish(user_id, items, caption, album_ocr_on)
         except Exception:
-            # не блокируем очередь из-за ошибки одного сообщения
             pass
         finally:
             publish_queue.task_done()
@@ -119,11 +120,7 @@ def _price_token_regex() -> str:
     return r"(?:€\s*\d{2,3}(?:[.,]\d{3})*|\d{2,3}(?:[.,]\d{3})*\s*€)"
 
 async def ocr_should_hide(file_id: str) -> bool:
-    """
-    Прятать ли фото-ценник (видео не трогаем).
-    Условия: есть явный токен цены (либо '€123', либо '123€', с тысячными) И
-    в тексте кадра встречается 'retail'/'price'/'prezzo' или знак '%'.
-    """
+    """Прятать ли фото-ценник (видео не трогаем)."""
     if not OCR_ENABLED:
         return False
     try:
@@ -136,10 +133,8 @@ async def ocr_should_hide(file_id: str) -> bool:
         img = Image.open(buf)
         txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
         tl = txt.lower()
-
         has_price_token = bool(re.search(_price_token_regex(), txt))
         has_kw = ("retail" in tl) or ("price" in tl) or ("prezzo" in tl) or ("%" in txt)
-
         return bool(has_price_token and has_kw)
     except Exception:
         return False
@@ -164,8 +159,9 @@ async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool)
     return kept or items[:1]
 
 # ====== ВСПОМОГАТЕЛЬНОЕ ======
-def round_price(value: float) -> int:
-    return int(round(value, 0))
+def ceil_price(value: float) -> int:
+    """Всегда вверх до целого евро."""
+    return int(math.ceil(value))
 
 def default_calc(price: float, discount: int) -> int:
     """
@@ -173,19 +169,20 @@ def default_calc(price: float, discount: int) -> int:
     """
     discounted = price * (1 - discount / 100)
     if discounted <= 250:
-        return round_price(discounted + 55)
+        return ceil_price(discounted + 55)
     elif discounted <= 400:
-        return round_price(discounted + 70)
+        return ceil_price(discounted + 70)
     else:
-        return round_price(discounted + 90)
+        return ceil_price(discounted + 90)
 
 def lux_calc(price: float, discount: int) -> int:
     """
     Калькулятор для /lux и /luxocr:
-    - Берём исходную цену и '-XX%' из текста => discounted.
+    - discounted = price после '-XX%'.
     - Если discounted ≤ 250€: +55€
       Если 251–400€: +70€
-      Если > 400€: +10% и +30€  (discounted * 1.10 + 30)
+      Если > 400€: +10% и +30€.
+    Всё округляем вверх.
     """
     discounted = price * (1 - discount / 100)
     if discounted <= 250:
@@ -194,40 +191,29 @@ def lux_calc(price: float, discount: int) -> int:
         final = discounted + 70
     else:
         final = discounted * 1.10 + 30
-    return round_price(final)
+    return ceil_price(final)
 
 # ====== РАЗБОР И ФОРМИРОВАНИЕ 5-СТРОЧНОЙ ПОДПИСИ ======
 
-# Удаляем только хештеги
 def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"#\S+", "", text)  # убрать #теги
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# Токены размеров: буквенные и/или цифры (38–46 и т.п.)
 SIZE_TOKEN = r"(?:XXS|XS|S|M|L|XL|XXL|[2-5]\d)"
 
 def _strip_seasons_for_size_scan(text: str) -> str:
-    """Убираем все NEW FW/SS-токены (FW25/26, SS25 и т.п.), чтобы 25/26 не считалось размером."""
     return re.sub(r"\b(?:NEW\s+)?(?:FW|SS)\d+(?:/\d+)?\b", " ", text, flags=re.I)
 
 def _strip_discounts_and_prices(text: str) -> str:
-    """Убираем скидки '-30%' и любые ценовые токены '€.../ ...€' перед поиском размеров."""
-    text = re.sub(r"-\s?\d{1,2}\s?%", " ", text)           # скидки
-    text = re.sub(_price_token_regex(), " ", text)         # цены
+    text = re.sub(r"-\s?\d{1,2}\s?%", " ", text)
+    text = re.sub(_price_token_regex(), " ", text)
     return text
 
 def extract_sizes_anywhere(text: str) -> str:
-    """
-    Вытягиваем размеры из любого места текста, даже если они стоят на одной строке с ценой.
-    Игнорируем сезоны (FW/SS), скидки (-30%) и цены (€2950).
-    Сохраняем исходный порядок и удаляем дубликаты.
-    """
     work = _strip_seasons_for_size_scan(text)
     work = _strip_discounts_and_prices(work)
-
-    # Собираем диапазоны "40-44", одиночные числа "38", и буквенные "XS" и т.д.
     ranges = re.findall(r"\b([2-5]\d)\s*[-–—]\s*([2-5]\d)\b", work)
     singles_num = re.findall(r"\b([2-5]\d)\b", work)
     singles_alpha = re.findall(r"\b(XXS|XS|S|M|L|XL|XXL)\b", work, flags=re.I)
@@ -235,21 +221,16 @@ def extract_sizes_anywhere(text: str) -> str:
     parts: List[str] = []
     used = set()
 
-    # Добавляем диапазоны как в исходном виде
     for a, b in ranges:
         token = f"{a}-{b}"
         if token not in used:
-            parts.append(token)
-            used.add(token)
+            parts.append(token); used.add(token)
 
-    # Добавляем буквенные
     for t in singles_alpha:
         token = t.upper()
         if token not in used:
-            parts.append(token)
-            used.add(token)
+            parts.append(token); used.add(token)
 
-    # Добавляем одиночные числовые, но не те, что уже покрыты диапазонами
     covered_nums = set()
     for a, b in ranges:
         a, b = int(a), int(b)
@@ -257,19 +238,13 @@ def extract_sizes_anywhere(text: str) -> str:
         covered_nums.update(str(x) for x in range(lo, hi + 1))
 
     for t in singles_num:
-        if t in covered_nums:
+        if t in covered_nums or t in used:
             continue
-        if t not in used:
-            parts.append(t)
-            used.add(t)
+        parts.append(t); used.add(t)
 
     return ", ".join(parts)
 
 def pick_sizes_line(lines: List[str]) -> str:
-    """
-    Предпочтительно берём отдельную строку с размерами без €/%/retail/price.
-    Если не нашли — fallback: собираем размеры из всего текста.
-    """
     for line in lines:
         l = line.strip()
         if not l:
@@ -278,13 +253,11 @@ def pick_sizes_line(lines: List[str]) -> str:
             continue
         if re.search(fr"\b{SIZE_TOKEN}\b", l, flags=re.I):
             return l
-        # варианты вида "40( на мне), 44"
         if re.search(r"\b[2-5]\d\b(?:\s*\([^)]+\))?(?:\s*,\s*\b[2-5]\d\b(?:\s*\([^)]+\))?)*", l):
             return l
     return ""
 
 def pick_season_line(lines: List[str]) -> str:
-    # сначала ищем строку с NEW FW/SS..., если нет — просто FW/SS...
     for line in lines:
         if re.search(r"\bNEW\s+(?:FW|SS)\d+(?:/\d+)?\b", line, flags=re.I):
             return line.strip()
@@ -294,10 +267,7 @@ def pick_season_line(lines: List[str]) -> str:
     return ""
 
 def pick_brand_line(lines: List[str], used: List[str]) -> str:
-    """
-    Берём первую строку, которая не используется под цену/ретейл/размер/сезон
-    и не выглядит как строка сезона (даже без NEW).
-    """
+    # Бренд больше не используем в подписи, но парсер оставим для совместимости.
     used_set = set([u for u in used if u])
     for line in lines:
         l = line.strip()
@@ -316,32 +286,24 @@ def pick_brand_line(lines: List[str], used: List[str]) -> str:
 def parse_number_token(token: Optional[str]) -> Optional[float]:
     if not token:
         return None
-    # поддержка 2.950 / 2,950
     return float(token.replace('.', '').replace(',', ''))
 
 def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     text = cleanup_text_basic(raw_text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # 1) цена/скидка/ретейл (цена может быть 2.950€ или 2,950€)
-    price_m   = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
-    discount_m= re.search(r"-(\d+)%", text)
-    retail_m  = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
+    price_m    = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
+    discount_m = re.search(r"-(\d+)%", text)
+    retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
 
-    price   = parse_number_token(price_m.group(1)) if price_m else None
-    discount= int(discount_m.group(1)) if discount_m else 0
-    retail  = parse_number_token(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
+    price    = parse_number_token(price_m.group(1)) if price_m else None
+    discount = int(discount_m.group(1)) if discount_m else 0
+    retail   = parse_number_token(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
 
-    # 2) размеры/сезон/бренд — строками
-    sizes_line  = pick_sizes_line(lines)
-    if not sizes_line:
-        # fallback: соберём из всего текста, исключая сезоны/цены/скидки
-        sizes_line = extract_sizes_anywhere(text)
-
+    sizes_line  = pick_sizes_line(lines) or extract_sizes_anywhere(text)
     season_line = pick_season_line(lines)
     brand_line  = pick_brand_line(lines, used=[sizes_line, season_line])
 
-    # защита от дубликатов между сезон/бренд
     if brand_line and season_line and brand_line.strip() == season_line.strip():
         brand_line = ""
 
@@ -360,13 +322,12 @@ def template_five_lines(final_price: int,
                         sizes_line: str,
                         season_line: str,
                         brand_line: str) -> str:
-    # Строго 5 строк; если чего-то нет — оставляем пустую строку на своём месте
-    line1 = f"✅ <b>{final_price}€</b>"
-    line2 = f"❌ <b>Retail price {round_price(retail)}€</b>"
+    # 5 строк; бренд не показываем (строка 5 пустая).
+    line1 = f"✅ <b>{ceil_price(final_price)}€</b>"
+    line2 = f"❌ <b>Retail price {ceil_price(retail)}€</b>"
     line3 = sizes_line or ""
     line4 = season_line or ""
-    line5 = brand_line or ""
-    # финальная защита от возможных дублей подряд
+    line5 = ""  # бренд убран по требованию
     lines = [line1, line2, line3, line4, line5]
     cleaned = []
     for s in lines:
@@ -374,7 +335,7 @@ def template_five_lines(final_price: int,
             continue
         cleaned.append(s)
     while len(cleaned) < 5:
-        cleaned.append("")  # сохраняем 5 строк
+        cleaned.append("")
     return "\n".join(cleaned[:5])
 
 def mk_mode(label: str,
@@ -436,8 +397,8 @@ async def show_help(msg: Message):
     await msg.answer(
         "Бот принимает фото/видео (в т.ч. альбомы) и текст с ценой.\n"
         "• Без цены — ждём твой текст (до 30с) и публикуем единым постом.\n"
-        "• Режимы /lux (OCR off) и /luxocr (OCR on) используют формулу: после скидки\n"
-        "  ≤250€ +55€; 251–400€ +70€; >400€ → +10% и +30€."
+        "• /lux (OCR off) и /luxocr (OCR on) используют формулу: после скидки\n"
+        "  ≤250€ +55€; 251–400€ +70€; >400€ → +10% и +30€. Всё округляем вверх."
     )
 
 @router.message(Command("ping"))
@@ -472,7 +433,6 @@ async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[
     }
 
 # ====== ХЕНДЛЕРЫ ======
-# Одиночное фото
 @router.message(F.photo & (F.media_group_id == None))
 async def handle_single_photo(msg: Message):
     item = {"kind": "photo", "fid": msg.photo[-1].file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
@@ -488,7 +448,6 @@ async def handle_single_photo(msg: Message):
     except Exception:
         pass
 
-# Одиночное видео
 @router.message(F.video & (F.media_group_id == None))
 async def handle_single_video(msg: Message):
     item = {"kind": "video", "fid": msg.video.file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
@@ -504,13 +463,11 @@ async def handle_single_video(msg: Message):
     except Exception:
         pass
 
-# Альбом (фото/видео вперемешку)
 @router.message(F.media_group_id)
 async def handle_album_any(msg: Message):
     chat_id, mgid = msg.chat.id, str(msg.media_group_id)
     key = (chat_id, mgid)
 
-    # Определяем тип и file_id
     if msg.photo:
         fid = msg.photo[-1].file_id
         kind = "photo"
@@ -546,7 +503,6 @@ async def handle_album_any(msg: Message):
         caption = data["caption"]
         user_id = data["user_id"]
 
-        # Сохраняем порядок и переносим элемент с подписью в начало
         items.sort(key=lambda x: x["mid"])
         idx_cap = next((i for i, it in enumerate(items) if it["cap"]), None)
         if idx_cap not in (None, 0):
@@ -568,7 +524,6 @@ async def handle_album_any(msg: Message):
 
     buf["task"] = asyncio.create_task(_flush_album())
 
-# Текст после медиа/альбома
 @router.message(F.text)
 async def handle_text(msg: Message):
     chat_id = msg.chat.id
@@ -592,7 +547,6 @@ async def handle_text(msg: Message):
         del last_media[chat_id]
         return
 
-    # Текст после ещё не закрытого альбома
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
