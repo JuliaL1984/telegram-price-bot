@@ -179,10 +179,17 @@ def _strip_seasons_for_size_scan(text: str) -> str:
 def extract_sizes_anywhere(text: str) -> str:
     """
     Вытягиваем размеры из любого места текста, даже если они стоят на одной строке с ценой.
-    Игнорируем все сезоны (FW/SS...), чтобы не спутать 25/26 с размером.
+    Игнорируем сезоны, скидки и ценовые токены, чтобы не путать 25/26 и -35% с размерами.
     Сохраняем исходный порядок и удаляем дубликаты.
     """
     work = _strip_seasons_for_size_scan(text)
+    # вырезаем скидки вида "-35%"
+    work = re.sub(r"-\s*\d{1,2}\s*%", " ", work)
+    # вырезаем выражения "35%" на всякий случай
+    work = re.sub(r"\b\d{1,2}\s*%", " ", work)
+    # вырезаем ценовые токены с €
+    work = re.sub(_price_token_regex(), " ", work)
+
     # Собираем диапазоны "40-44", одиночные числа "38", и буквенные "XS" и т.д.
     ranges = re.findall(r"\b([2-5]\d)\s*[-–—]\s*([2-5]\d)\b", work)
     singles_num = re.findall(r"\b([2-5]\d)\b", work)
@@ -205,14 +212,12 @@ def extract_sizes_anywhere(text: str) -> str:
             parts.append(token)
             used.add(token)
 
-    # Добавляем одиночные числовые, но не те, что уже покрыты диапазонами
+    # Числа, не покрытые диапазонами
     covered_nums = set()
     for a, b in ranges:
         a, b = int(a), int(b)
-        if a <= b:
-            covered_nums.update(str(x) for x in range(a, b + 1))
-        else:
-            covered_nums.update(str(x) for x in range(b, a + 1))
+        lo, hi = (a, b) if a <= b else (b, a)
+        covered_nums.update(str(x) for x in range(lo, hi + 1))
 
     for t in singles_num:
         if t in covered_nums:
@@ -293,7 +298,7 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     # 2) размеры/сезон/бренд — строками
     sizes_line  = pick_sizes_line(lines)
     if not sizes_line:
-        # fallback: соберём из всего текста, исключая сезоны
+        # fallback: соберём из всего текста, исключая сезоны/скидки/цены
         sizes_line = extract_sizes_anywhere(text)
 
     season_line = pick_season_line(lines)
