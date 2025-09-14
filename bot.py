@@ -21,7 +21,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002973176038"))
 ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "1500"))  # было 800
+ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "1500"))  # стабильнее собирает альбомы
 ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
@@ -104,9 +104,8 @@ def _price_token_regex() -> str:
 async def ocr_should_hide(file_id: str) -> bool:
     """
     Прятать ли фото-ценник (видео не трогаем).
-    Строго: должен быть явный токен цены (либо '€123', либо '123€', с тысячными разделителями) И
-    рядом с этим кадром должны встречаться ключевые слова (retail/price/prezzo) или знак процента.
-    Это резко уменьшает ложные срабатывания.
+    Условия: есть явный токен цены (либо '€123', либо '123€', с тысячными) И
+    в тексте кадра встречается 'retail'/'price'/'prezzo' или знак '%'.
     """
     if not OCR_ENABLED:
         return False
@@ -173,22 +172,23 @@ def cleanup_text_basic(text: str) -> str:
 SIZE_TOKEN = r"(?:XXS|XS|S|M|L|XL|XXL|[2-5]\d)"
 
 def _strip_seasons_for_size_scan(text: str) -> str:
-    """Убираем все подстроки вида NEW FW25/26, FW25/26, SS25 и т.п., чтобы цифры 25/26 не считались размерами."""
+    """Убираем все NEW FW/SS-токены (FW25/26, SS25 и т.п.), чтобы 25/26 не считалось размером."""
     return re.sub(r"\b(?:NEW\s+)?(?:FW|SS)\d+(?:/\d+)?\b", " ", text, flags=re.I)
+
+def _strip_discounts_and_prices(text: str) -> str:
+    """Убираем скидки '-30%' и любые ценовые токены '€.../ ...€' перед поиском размеров."""
+    text = re.sub(r"-\s?\d{1,2}\s?%", " ", text)           # скидки
+    text = re.sub(_price_token_regex(), " ", text)         # цены
+    return text
 
 def extract_sizes_anywhere(text: str) -> str:
     """
     Вытягиваем размеры из любого места текста, даже если они стоят на одной строке с ценой.
-    Игнорируем сезоны, скидки и ценовые токены, чтобы не путать 25/26 и -35% с размерами.
+    Игнорируем сезоны (FW/SS), скидки (-30%) и цены (€2950).
     Сохраняем исходный порядок и удаляем дубликаты.
     """
     work = _strip_seasons_for_size_scan(text)
-    # вырезаем скидки вида "-35%"
-    work = re.sub(r"-\s*\d{1,2}\s*%", " ", work)
-    # вырезаем выражения "35%" на всякий случай
-    work = re.sub(r"\b\d{1,2}\s*%", " ", work)
-    # вырезаем ценовые токены с €
-    work = re.sub(_price_token_regex(), " ", work)
+    work = _strip_discounts_and_prices(work)
 
     # Собираем диапазоны "40-44", одиночные числа "38", и буквенные "XS" и т.д.
     ranges = re.findall(r"\b([2-5]\d)\s*[-–—]\s*([2-5]\d)\b", work)
@@ -212,7 +212,7 @@ def extract_sizes_anywhere(text: str) -> str:
             parts.append(token)
             used.add(token)
 
-    # Числа, не покрытые диапазонами
+    # Добавляем одиночные числовые, но не те, что уже покрыты диапазонами
     covered_nums = set()
     for a, b in ranges:
         a, b = int(a), int(b)
@@ -298,11 +298,15 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     # 2) размеры/сезон/бренд — строками
     sizes_line  = pick_sizes_line(lines)
     if not sizes_line:
-        # fallback: соберём из всего текста, исключая сезоны/скидки/цены
+        # fallback: соберём из всего текста, исключая сезоны/цены/скидки
         sizes_line = extract_sizes_anywhere(text)
 
     season_line = pick_season_line(lines)
     brand_line  = pick_brand_line(lines, used=[sizes_line, season_line])
+
+    # защита от дубликатов между сезон/бренд
+    if brand_line and season_line and brand_line.strip() == season_line.strip():
+        brand_line = ""
 
     return {
         "price": price,
@@ -325,7 +329,16 @@ def template_five_lines(final_price: int,
     line3 = sizes_line or ""
     line4 = season_line or ""
     line5 = brand_line or ""
-    return "\n".join([line1, line2, line3, line4, line5])
+    # финальная защита от возможных дублей подряд
+    lines = [line1, line2, line3, line4, line5]
+    cleaned = []
+    for s in lines:
+        if cleaned and s and s == cleaned[-1]:
+            continue
+        cleaned.append(s)
+    while len(cleaned) < 5:
+        cleaned.append("")  # сохраняем 5 строк
+    return "\n".join(cleaned[:5])
 
 def mk_mode(label: str,
             calc: Callable[[float, int], int] = default_calc,
