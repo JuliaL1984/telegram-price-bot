@@ -98,7 +98,7 @@ if OCR_ENABLED:
         OCR_ENABLED = False
 
 async def ocr_should_hide(file_id: str) -> bool:
-    """Строгий детектор ценника для фото."""
+    """Прятать ли фото-ценник (видео не трогаем)."""
     if not OCR_ENABLED:
         return False
     try:
@@ -112,13 +112,14 @@ async def ocr_should_hide(file_id: str) -> bool:
         txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
         tl = txt.lower()
 
-        # Признаки: валюта + «длинное» число + (скидка % или слово price/prezzo/retail)
+        # Более строгий фильтр:
         has_euro = ("€" in txt) or (" eur" in tl) or ("eur " in tl)
-        has_kw   = ("retail price" in tl) or ("prezzo" in tl) or (" price" in tl) or ("retail" in tl)
+        has_kw   = ("retail" in tl) or ("price" in tl) or ("prezzo" in tl)
         has_pct  = "%" in txt
-        long_num = bool(re.search(r"\b\d{3,5}\b", txt))  # 750, 1900, 12500 и т.п.
+        long_num = bool(re.search(r"\b\d{3,6}\b", txt))  # 750, 1680, 12500 и т.п.
 
-        return bool(has_euro and long_num and (has_pct or has_kw))
+        # Прячем ТОЛЬКО если прям явно ценник
+        return bool(has_euro and long_num and (has_kw or has_pct))
     except Exception:
         return False
 
@@ -175,29 +176,52 @@ def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# -------- НОВОЕ: парсим и буквенные, и ЧИСЛОВЫЕ размеры --------
+# -------- Размеры: буквенные и числовые, без цен/скидок/сезонов --------
 SIZE_TOKEN = r"(?:XXS|XS|S|M|L|XL|XXL|[2-5]\d)"
+EXCLUDE_FOR_SIZES = re.compile(
+    r"(€|%|\bFW\d+(?:/\d+)?\b|\bSS\d+(?:/\d+)?\b|\bNEW\b|\bRETAIL\b|\bPRICE\b|\bPREZZO\b|#)",
+    flags=re.I
+)
 
 def parse_sizes_line(text: str) -> str:
-    """Возвращает строку, где перечислены размеры (XS… или 38, 40-44, '40( на мне), 44')."""
-    for line in text.splitlines():
-        if re.search(fr"\b{SIZE_TOKEN}\b", line, flags=re.I):
-            return line.strip()
-    return ""
+    """
+    Возвращает строку с размерами (XS…XXL, 38, 40–44, '40( на мне), 44').
+    Игнорируем строки с ценой/скидкой/сезоном/хэштегами.
+    """
+    candidates: List[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if EXCLUDE_FOR_SIZES.search(line):
+            continue
+        # буквенные/числовые + диапазоны/через запятую
+        if re.search(fr"\b{SIZE_TOKEN}\b(?:\s*(?:[-–—]|to|,)\s*\b{SIZE_TOKEN}\b)*", line, flags=re.I):
+            candidates.append(line)
+        # варианты вида "40( на мне), 44"
+        elif re.search(r"\b[2-5]\d\b(?:\s*\([^)]+\))?(?:\s*,\s*\b[2-5]\d\b(?:\s*\([^)]+\))?)*", line):
+            candidates.append(line)
+    return candidates[0] if candidates else ""
 
 def parse_input(text: str) -> Dict[str, Optional[str]]:
-    price_m   = re.search(r"(\d+)\s*€", text)
+    # поддержка 2.950€ и 2,950€
+    price_m   = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
     discount_m= re.search(r"-(\d+)%", text)
-    retail_m  = re.search(r"Retail\s*price\s*(\d+)", text, flags=re.I)
+    retail_m  = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
     sizes     = parse_sizes_line(text)
-    season_m  = re.search(r"(FW\d+\/\d+|SS\d+)", text)
+    season_m  = re.search(r"(FW\d+\/\d+|SS\d+)", text, flags=re.I)
 
-    price   = float(price_m.group(1)) if price_m else None
+    def num(x: Optional[str]) -> Optional[float]:
+        if not x:
+            return None
+        # 2.950 -> 2950 ; 2,950 -> 2950
+        return float(x.replace('.', '').replace(',', ''))
+
+    price   = num(price_m.group(1)) if price_m else None
     discount= int(discount_m.group(1)) if discount_m else 0
-    retail  = float(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
-    season  = season_m.group(1) if season_m else ""
+    retail  = num(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
+    season  = season_m.group(1).upper() if season_m else ""
     return {"price": price, "discount": discount, "retail": retail, "sizes": sizes, "season": season}
-# ----------------------------------------------------------------
 
 def mk_mode(label: str,
             calc: Callable[[float, int], int] = default_calc,
@@ -408,39 +432,4 @@ async def handle_text(msg: Message):
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
         cand.sort(key=lambda kv: last_mid(kv[1]))
-        eligible = [kv for kv in cand if last_mid(kv[1]) <= msg.message_id]
-        key, data = (eligible[-1] if eligible else cand[-1])
-
-        items: List[Dict[str, Any]] = data["items"]
-        caption = (data.get("caption") or "")
-        if caption:
-            caption += "\n"
-        caption += (msg.text or "")
-
-        items.sort(key=lambda x: x["mid"])
-        idx_cap = next((i for i, it in enumerate(items) if it["cap"]), None)
-        if idx_cap not in (None, 0):
-            items.insert(0, items.pop(idx_cap))
-
-        result = build_result_text(user_id, caption)
-
-        if data.get("task"):
-            data["task"].cancel()
-        album_buffers.pop(key, None)
-
-        if result:
-            await publish_to_target(items, result)
-        else:
-            await publish_to_target(items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
-        return
-
-    return
-
-# ====== ЗАПУСК ======
-async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    asyncio.create_task(publish_worker())
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        eligible =
