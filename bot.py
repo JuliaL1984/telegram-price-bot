@@ -286,11 +286,26 @@ def extract_sizes_anywhere(text: str) -> str:
             continue
         add(norm)
 
-    # игнорируем единственное число, чтобы не ловить «6» как размер
+    # --- Антишум: теперь НЕ отбрасываем одиночный реальный размер ---
     evidence_of_ranges = bool(ranges_dash or ranges_slash)
     has_alpha = bool(singles_alpha)
-    if not evidence_of_ranges and not has_alpha and len([p for p in parts if re.fullmatch(r"\d+(?:,\d)?", p)]) == 1:
-        return ""
+
+    if not evidence_of_ranges and not has_alpha:
+        only_nums = [p for p in parts if re.fullmatch(r"\d+(?:,\d)?", p)]
+        if len(only_nums) == 1:
+            # если это явный размер (EU 30–46 или US 5–12), оставляем
+            val = only_nums[0].replace(",", ".")
+            try:
+                f = float(val)
+                is_eu = 30.0 <= f <= 46.0
+                is_us = 5.0 <= f <= 12.0
+                if not (is_eu or is_us):
+                    return ""
+            except Exception:
+                return ""
+        elif len(only_nums) == 0:
+            return ""
+    # ----------------------------------------------------------------
 
     return ", ".join(parts)
 
@@ -302,9 +317,15 @@ def pick_sizes_line(lines: List[str]) -> str:
             continue
         if re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I):
             continue
-        # Допускаем смешанные разделители ',' и '/'
-        if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I) or \
-           re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
+        # допускаем:
+        #  - алфавитные размеры (XS…XXL)
+        #  - перечни 39/40/41 или 36,5/37
+        #  - одиночный числовой размер (например, 44)
+        if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I):
+            return l
+        if re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
+            return l
+        if re.fullmatch(rf"{SIZE_NUM_ANY}", l):
             return l
     return ""
 
@@ -328,7 +349,7 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
 
     price_m    = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
     discount_m = re.search(r"-(\d+)%", text)
-    retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
+    retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)  # FIX \d
 
     price    = parse_number_token(price_m.group(1)) if price_m else None
     discount = int(discount_m.group(1)) if discount_m else 0
