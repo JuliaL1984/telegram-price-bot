@@ -110,8 +110,9 @@ def default_calc(price: float, discount: int) -> int:
     else:
         return round_price(discounted + 90)
 
+# ==== ВАЖНО: ШАБЛОН БЕЗ ЛЮБЫХ МЕТОК ====
 def default_template(final_price: int, retail: float, sizes: str, season: str, mode_label: Optional[str] = None) -> str:
-    # убрали вывод (SALE) и любых скобок с меткой
+    # убрали вывод (SALE) и любых меток вообще
     return (
         f"✅ <b>{final_price}€</b>\n"
         f"❌ <b>Retail price {round_price(retail)}€</b>\n"
@@ -212,9 +213,10 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
     if price is None:
         return None
     mode = MODES.get(active_mode.get(user_id, "sale"), MODES["sale"])
-    calc_fn, tpl_fn, label = mode["calc"], mode["template"], mode["label"]
+    calc_fn, tpl_fn, _label = mode["calc"], mode["template"], mode["label"]
     final_price = calc_fn(price, data.get("discount", 0))
-    return tpl_fn(final_price, data["retail"], data["sizes"], data["season"], mode_label=label)
+    # ВАЖНО: НЕ передаем mode_label, чтобы нигде не появлялись метки
+    return tpl_fn(final_price, data["retail"], data["sizes"], data["season"], mode_label=None)
 
 # ====== ХЕЛПЕР ======
 async def _remember_media_for_text(chat_id: int, file_ids: List[str], mgid: Optional[str] = None, caption: str = ""):
