@@ -62,7 +62,7 @@ def is_ocr_enabled_for(user_id: int) -> bool:
     """
     /lux      -> OCR off для альбомов
     /luxocr   -> OCR on  для альбомов
-    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALБУМС
+    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALBUMS
     """
     mode = active_mode.get(user_id, "sale")
     if mode == "lux":
@@ -76,11 +76,10 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
     if not items:
         return
 
-    # >>> added: текстовый пост «как есть» (идёт через ту же очередь и сохраняет порядок)
+    # текстовый пост «как есть» (идёт через ту же очередь и сохраняет порядок)
     if items and items[0].get("kind") == "text":
         await bot.send_message(TARGET_CHAT_ID, caption or "")
         return
-    # <<< added
 
     # OCR-фильтрация только для альбомов при album_ocr_on=True (порядок сохраняем)
     items = await filter_pricetag_media(items, album_ocr_on)
@@ -220,10 +219,12 @@ def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# Поддержка обувных размеров: 30–46 c половинками, списки через "," и "/" и диапазоны "36-41"/"36/41"
+# ====== РАЗМЕРЫ: EU 30–46 и US 5–12, половинки допускаются ======
 SIZE_ALPHA = r"(?:XXS|XS|S|M|L|XL|XXL)"
-SIZE_NUM_WIDE = r"(?:3\d|4[0-6])(?:[.,]5)?"
-SIZE_TOKEN = rf"(?:{SIZE_ALPHA}|{SIZE_NUM_WIDE})"  # для совместимости со старыми проверками
+SIZE_NUM_EU = r"(?:3\d|4[0-6])(?:[.,]5)?"        # 30–46 + ,5
+SIZE_NUM_US = r"(?:[5-9]|1[0-2])(?:[.,]5)?"      # 5–12 + ,5
+SIZE_NUM_ANY = rf"(?:{SIZE_NUM_EU}|{SIZE_NUM_US})"
+SIZE_TOKEN = rf"(?:{SIZE_ALPHA}|{SIZE_NUM_ANY})"  # для совместимости со старыми проверками
 
 def _strip_seasons_for_size_scan(text: str) -> str:
     """Убираем NEW FW/SS-токены, чтобы числа сезона не считались размерами."""
@@ -240,12 +241,12 @@ def extract_sizes_anywhere(text: str) -> str:
     work = _strip_seasons_for_size_scan(text)
     work = _strip_discounts_and_prices(work)
 
-    # Диапазоны: "36-41" и "36/41"
-    ranges_dash = re.findall(rf"\b({SIZE_NUM_WIDE})\s*[-–—]\s*({SIZE_NUM_WIDE})\b", work)
-    ranges_slash = re.findall(rf"\b({SIZE_NUM_WIDE})\s*/\s*({SIZE_NUM_WIDE})\b", work)
+    # Диапазоны: "36-41" и "36/41" или "6-10"/"6/10"
+    ranges_dash  = re.findall(rf"\b({SIZE_NUM_ANY})\s*[-–—]\s*({SIZE_NUM_ANY})\b", work)
+    ranges_slash = re.findall(rf"\b({SIZE_NUM_ANY})\s*/\s*({SIZE_NUM_ANY})\b", work)
 
     # Отдельные токены (включая половинки) и списки с разделителями
-    singles_num = re.findall(rf"\b({SIZE_NUM_WIDE})\b", work)
+    singles_num   = re.findall(rf"\b({SIZE_NUM_ANY})\b", work)
     singles_alpha = re.findall(rf"\b({SIZE_ALPHA})\b", work, flags=re.I)
 
     parts: List[str] = []
@@ -294,9 +295,9 @@ def pick_sizes_line(lines: List[str]) -> str:
             continue
         if re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I):
             continue
-        # буквенные или числовые (30–46 ± половинки) + списки через "," или "/"
+        # буквенные или числовые (EU/US) + списки через "," или "/"
         if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I) or \
-           re.search(rf"\b{SIZE_NUM_WIDE}(?:\s*(?:[,/]\s*{SIZE_NUM_WIDE}))*\b", l):
+           re.search(rf"\b{SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))*\b", l):
             return l
     return ""
 
@@ -625,7 +626,7 @@ async def handle_text(msg: Message):
             await publish_to_target(seq, first_mid, user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
         return
 
-    # >>> added: чистые тексты (без цены/скидки) — переслать как есть, сохраняя порядок очереди
+    # Чистые тексты (без цены/скидки) — переслать как есть, сохраняя порядок очереди
     txt = msg.text or ""
     has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"-(\d+)\s?%", txt))
     if not has_price:
@@ -633,7 +634,6 @@ async def handle_text(msg: Message):
         text_item = [{"kind": "text", "fid": "", "mid": msg.message_id, "cap": True}]
         await publish_to_target(seq, msg.message_id, msg.from_user.id, text_item, txt)
         return
-    # <<< added
 
     return
 
