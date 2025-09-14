@@ -31,7 +31,8 @@ ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
 # Базовая политика: в альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
-FILTER_PRICETAGS_IN_ALBUMS = os.getenv("FILTER_PRICETAGS_IN_ALBUMС", "1") == "1" if "FILTER_PRICETAGS_IN_ALBUMС" in os.environ else os.getenv("FILTER_PRICETAGS_IN_ALBUMS","1")=="1"
+FILTER_PRICETAGS_IN_ALBUMС = os.getenv("FILTER_PRICETAGS_IN_ALBUMС")
+FILTER_PRICETAGS_IN_ALBUMS = (FILTER_PRICETAGS_IN_ALBUMС == "1") if FILTER_PRICETAGS_IN_ALBUMС is not None else (os.getenv("FILTER_PRICETAGS_IN_ALBUMS","1")=="1")
 
 # ====== ИНИЦИАЛИЗАЦИЯ ======
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -268,6 +269,13 @@ def extract_sizes_anywhere(text: str) -> str:
         if norm in covered_nums:
             continue
         add(norm)
+
+    # >>> tweak: ignore single-number "sizes" to avoid picking quantities like "6"
+    evidence_of_ranges = bool(ranges_dash or ranges_slash)
+    has_alpha = bool(singles_alpha)
+    if not evidence_of_ranges and not has_alpha and len([p for p in parts if re.fullmatch(r"\d+(?:,\d)?", p)]) == 1:
+        return ""
+    # <<< tweak
 
     return ", ".join(parts)
 
