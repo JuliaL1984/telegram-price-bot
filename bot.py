@@ -33,19 +33,16 @@ router = Router()
 dp.include_router(router)
 
 # ====== ПАМЯТЬ ======
-last_media: Dict[int, Dict] = {}             # {chat_id: {"ts", "file_ids", "caption", "mgid"}}
-active_mode: Dict[int, str] = {}             # {user_id: "mode"}
-album_buffers: Dict[Tuple[int, str], Dict] = {}  # {(chat_id, media_group_id): {"items", "caption", "task", "user_id"}}
+last_media: Dict[int, Dict] = {}
+active_mode: Dict[int, str] = {}
+album_buffers: Dict[Tuple[int, str], Dict] = {}
 
 # ====== ОЧЕРЕДЬ ПУБЛИКАЦИЙ (FIFO) ======
 publish_queue: "asyncio.Queue[Tuple[List[str], str]]" = asyncio.Queue()
 
 async def _do_publish(file_ids: List[str], caption: str):
-    """Реальная отправка сообщений (не вызывать напрямую)."""
     if not file_ids:
         return
-    # ВАЖНО: OCR-фильтрация выполняется ЗДЕСЬ, внутри воркера,
-    # чтобы дольше обрабатывающиеся посты не обгоняли более быстрые.
     fids = await filter_pricetag_photos(file_ids)
     if len(fids) == 1:
         await bot.send_photo(TARGET_CHAT_ID, fids[0], caption=caption)
@@ -55,19 +52,16 @@ async def _do_publish(file_ids: List[str], caption: str):
         await bot.send_media_group(TARGET_CHAT_ID, media)
 
 async def publish_worker():
-    """Единственный воркер, публикует все задачи по очереди."""
     while True:
         file_ids, caption = await publish_queue.get()
         try:
             await _do_publish(file_ids, caption)
         except Exception:
-            # не блокируем очередь из-за ошибки одного сообщения
             pass
         finally:
             publish_queue.task_done()
 
 async def publish_to_target(file_ids: List[str], caption: str):
-    """Ставит публикацию в очередь (сохраняет порядок)."""
     await publish_queue.put((file_ids, caption))
 
 # ====== OCR ======
@@ -117,9 +111,8 @@ def default_calc(price: float, discount: int) -> int:
         return round_price(discounted + 90)
 
 def default_template(final_price: int, retail: float, sizes: str, season: str, mode_label: Optional[str] = None) -> str:
-    tag = f"<i>({mode_label})</i>\n" if mode_label else ""
+    # убрали вывод (SALE) и любых скобок с меткой
     return (
-        f"{tag}"
         f"✅ <b>{final_price}€</b>\n"
         f"❌ <b>Retail price {round_price(retail)}€</b>\n"
         f"{sizes}\n"
@@ -211,7 +204,7 @@ async def show_help(msg: Message):
 async def ping(msg: Message):
     await msg.answer("pong")
 
-# ====== ВСПОМОГ.: сборка подписи по режиму ======
+# ====== СБОРКА ПОДПИСИ ======
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
     cleaned = cleanup_text_basic(caption)
     data = parse_input(cleaned)
@@ -223,7 +216,7 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
     final_price = calc_fn(price, data.get("discount", 0))
     return tpl_fn(final_price, data["retail"], data["sizes"], data["season"], mode_label=label)
 
-# ====== ХЕЛПЕР для ожидания текста ======
+# ====== ХЕЛПЕР ======
 async def _remember_media_for_text(chat_id: int, file_ids: List[str], mgid: Optional[str] = None, caption: str = ""):
     last_media[chat_id] = {
         "ts": datetime.now(),
@@ -241,7 +234,6 @@ async def handle_single_photo(msg: Message):
     if caption:
         result = build_result_text(msg.from_user.id, caption)
         if result:
-            # В очередь без OCR — фильтрация выполнится в воркере
             await publish_to_target([fid], result)
             return
 
@@ -274,7 +266,6 @@ async def handle_album_photo(msg: Message):
 
     async def _flush_album():
         await asyncio.sleep(ALBUM_SETTLE_MS / 1000)
-
         data = album_buffers.pop(key, None)
         if not data:
             return
@@ -309,8 +300,8 @@ async def handle_album_photo(msg: Message):
 @router.message(F.text)
 async def handle_text(msg: Message):
     chat_id, user_id = msg.chat.id, msg.from_user.id
-
     bucket = last_media.get(chat_id)
+
     if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
         raw_text = (bucket.get("caption") or "")
         if raw_text:
@@ -364,7 +355,6 @@ async def handle_text(msg: Message):
 # ====== ЗАПУСК ======
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    # запускаем воркер очереди перед polling
     asyncio.create_task(publish_worker())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
