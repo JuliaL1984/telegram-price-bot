@@ -31,7 +31,7 @@ ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
 # Базовая политика: в альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
-FILTER_PRICETAGS_IN_ALBUMS = os.getenv("FILTER_PRICETAGS_IN_ALBUMS", "1") == "1"
+FILTER_PRICETAGS_IN_ALBUMS = os.getenv("FILTER_PRICETAGS_IN_ALBUMС", "1") == "1" if "FILTER_PRICETAGS_IN_ALBUMС" in os.environ else os.getenv("FILTER_PRICETAGS_IN_ALBUMS","1")=="1"
 
 # ====== ИНИЦИАЛИЗАЦИЯ ======
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -76,12 +76,12 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
     if not items:
         return
 
-    # текстовый пост «как есть» (идёт через ту же очередь и сохраняет порядок)
+    # текстовый пост «как есть»
     if items and items[0].get("kind") == "text":
         await bot.send_message(TARGET_CHAT_ID, caption or "")
         return
 
-    # OCR-фильтрация только для альбомов при album_ocr_on=True (порядок сохраняем)
+    # OCR-фильтрация только для альбомов при album_ocr_on=True
     items = await filter_pricetag_media(items, album_ocr_on)
 
     if len(items) == 1:
@@ -92,20 +92,15 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
             await bot.send_photo(TARGET_CHAT_ID, it["fid"], caption=caption)
         return
 
-    # Альбом: подпись ставим к первому элементу (Telegram-требование). Порядок не трогаем.
+    # Альбом: подпись к первому
     first = items[0]
     media = []
     if first["kind"] == "video":
         media.append(InputMediaVideo(media=first["fid"], caption=caption, parse_mode=ParseMode.HTML))
     else:
         media.append(InputMediaPhoto(media=first["fid"], caption=caption, parse_mode=ParseMode.HTML))
-
     for it in items[1:]:
-        if it["kind"] == "video":
-            media.append(InputMediaVideo(media=it["fid"]))
-        else:
-            media.append(InputMediaPhoto(media=it["fid"]))
-
+        media.append(InputMediaVideo(media=it["fid"]) if it["kind"] == "video" else InputMediaPhoto(media=it["fid"]))
     await bot.send_media_group(TARGET_CHAT_ID, media)
 
 async def publish_worker():
@@ -116,7 +111,7 @@ async def publish_worker():
         _pending[seq] = payload
         publish_queue.task_done()
 
-        # Барьер: публикуем строго по seq, ни один следующий не обгонит текущий
+        # Публикуем строго по seq
         while _next_to_publish in _pending:
             s, first_mid, user_id, items, caption, album_ocr_on = _pending.pop(_next_to_publish)
             try:
@@ -139,7 +134,7 @@ if OCR_ENABLED:
         OCR_ENABLED = False
 
 def _price_token_regex() -> str:
-    # "€123", "€ 2.950", "2,950 €", "2950€" — поддержка разделителей тысяч . или ,
+    # "€123", "€ 2.950", "2,950 €", "2950€"
     return r"(?:€\s*\d{2,3}(?:[.,]\d{3})*|\d{2,3}(?:[.,]\d{3})*\s*€)"
 
 async def ocr_should_hide(file_id: str) -> bool:
@@ -165,30 +160,26 @@ async def ocr_should_hide(file_id: str) -> bool:
 async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool) -> List[Dict[str, Any]]:
     """
     Одиночные: ничего не удаляем.
-    Альбомы: при album_ocr_on=True — вырезаем ТОЛЬКО кадры-ценники (видео никогда не режем).
-    Порядок кадров всегда сохраняется (как пришёл от Telegram).
-    Если всё вырезалось — оставляем первый исходный, чтобы не «съесть» публикацию.
+    Альбомы: при album_ocr_on=True — вырезаем ТОЛЬКО кадры-ценники (видео не режем).
+    Порядок сохраняем. Если всё вырезалось — оставляем первый кадр.
     """
     if len(items) == 1 or not album_ocr_on:
         return items
 
     kept: List[Dict[str, Any]] = []
-    for it in items:  # идём в исходном порядке
+    for it in items:
         if it["kind"] == "photo":
             if not await ocr_should_hide(it["fid"]):
                 kept.append(it)
         else:
-            kept.append(it)  # видео всегда оставляем
-
+            kept.append(it)
     return kept if kept else items[:1]
 
 # ====== КАЛЬКУЛЯТОРЫ ======
 def ceil_price(value: float) -> int:
-    """Всегда вверх до целого евро (с защитой от 959.999999)."""
     return int(math.ceil(value - 1e-9))
 
 def default_calc(price: float, discount: int) -> int:
-    """Базовый калькулятор для остальных режимов."""
     discounted = price * (1 - discount / 100)
     if discounted <= 250:
         return ceil_price(discounted + 55)
@@ -198,11 +189,6 @@ def default_calc(price: float, discount: int) -> int:
         return ceil_price(discounted + 90)
 
 def lux_calc(price: float, discount: int) -> int:
-    """
-    /lux и /luxocr:
-    после скидки → ≤250 +55; 251–400 +70; >400 → +10% и +30€
-    всё округляем вверх
-    """
     discounted = price * (1 - discount / 100)
     if discounted <= 250:
         final = discounted + 55
@@ -212,50 +198,47 @@ def lux_calc(price: float, discount: int) -> int:
         final = discounted * 1.10 + 30
     return ceil_price(final)
 
-# ====== РАЗБОР И ФОРМИРОВАНИЕ 5-СТРОЧНОЙ ПОДПИСИ ======
+# ====== РАЗБОР И 5-СТРОЧНАЯ ПОДПИСЬ ======
 def cleanup_text_basic(text: str) -> str:
-    text = re.sub(r"#\S+", "", text)  # убрать #теги
+    text = re.sub(r"#\S+", "", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# ====== РАЗМЕРЫ: EU 30–46 и US 5–12, половинки допускаются ======
-SIZE_ALPHA = r"(?:XXS|XS|S|M|L|XL|XXL)"
-SIZE_NUM_EU = r"(?:3\d|4[0-6])(?:[.,]5)?"        # 30–46 + ,5
-SIZE_NUM_US = r"(?:[5-9]|1[0-2])(?:[.,]5)?"      # 5–12 + ,5
+# === РАЗМЕРЫ: EU 30–46 и US 5–12 (с половинками) ===
+SIZE_ALPHA   = r"(?:XXS|XS|S|M|L|XL|XXL)"
+SIZE_NUM_EU  = r"(?:3\d|4[0-6])(?:[.,]5)?"
+SIZE_NUM_US  = r"(?:[5-9]|1[0-2])(?:[.,]5)?"
 SIZE_NUM_ANY = rf"(?:{SIZE_NUM_EU}|{SIZE_NUM_US})"
-SIZE_TOKEN = rf"(?:{SIZE_ALPHA}|{SIZE_NUM_ANY})"  # для совместимости со старыми проверками
+SIZE_TOKEN   = rf"(?:{SIZE_ALPHA}|{SIZE_NUM_ANY})"
 
 def _strip_seasons_for_size_scan(text: str) -> str:
-    """Убираем NEW FW/SS-токены, чтобы числа сезона не считались размерами."""
     return re.sub(r"\b(?:NEW\s+)?(?:FW|SS)\d+(?:/\d+)?\b", " ", text, flags=re.I)
 
 def _strip_discounts_and_prices(text: str) -> str:
-    """Убираем скидки и ценовые токены перед поиском размеров."""
-    text = re.sub(r"-\s?\d{1,2}\s?%", " ", text)           # скидки
-    text = re.sub(_price_token_regex(), " ", text)         # цены
+    text = re.sub(r"-\s?\d{1,2}\s?%", " ", text)
+    text = re.sub(_price_token_regex(), " ", text)
     return text
 
 def extract_sizes_anywhere(text: str) -> str:
-    """Вытягиваем размеры из любого места текста, сохраняя порядок и без дублей."""
+    """Достаём размеры из любого места, сохраняя порядок и без дублей."""
     work = _strip_seasons_for_size_scan(text)
     work = _strip_discounts_and_prices(work)
 
-    # Диапазоны: "36-41" и "36/41" или "6-10"/"6/10"
-    ranges_dash  = re.findall(rf"\b({SIZE_NUM_ANY})\s*[-–—]\s*({SIZE_NUM_ANY})\b", work)
-    ranges_slash = re.findall(rf"\b({SIZE_NUM_ANY})\s*/\s*({SIZE_NUM_ANY})\b", work)
+    # Диапазоны: "36-41", "36/41", "6-10", "6/10"
+    ranges_dash  = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})\s*[-–—]\s*({SIZE_NUM_ANY})(?!\d)", work)
+    ranges_slash = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})\s*/\s*({SIZE_NUM_ANY})(?!\d)", work)
 
-    # Отдельные токены (включая половинки) и списки с разделителями
-    singles_num   = re.findall(rf"\b({SIZE_NUM_ANY})\b", work)
+    singles_num   = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})(?!\d)", work)
     singles_alpha = re.findall(rf"\b({SIZE_ALPHA})\b", work, flags=re.I)
 
     parts: List[str] = []
     used = set()
 
-    def add(token: str):
-        token = token.replace(".5", ",5")
-        if token not in used:
-            parts.append(token); used.add(token)
+    def add(tok: str):
+        tok = tok.replace(".5", ",5")
+        if tok not in used:
+            parts.append(tok); used.add(tok)
 
     for a, b in (ranges_dash + ranges_slash):
         add(f"{a.replace('.5', ',5')}-{b.replace('.5', ',5')}")
@@ -263,7 +246,7 @@ def extract_sizes_anywhere(text: str) -> str:
     for t in singles_alpha:
         add(t.upper())
 
-    # Чтобы не дублировать числа, попавшие внутрь диапазонов, развернём диапазоны «умом»
+    # Исключаем числа, попавшие внутрь диапазонов
     covered_nums = set()
     def _expand(n1: str, n2: str):
         try:
@@ -272,7 +255,8 @@ def extract_sizes_anywhere(text: str) -> str:
             lo, hi = sorted((a, b))
             x = lo
             while x <= hi + 1e-9:
-                covered_nums.add(("{:.1f}".format(x)).replace(".5", ",5").rstrip("0").rstrip(","))
+                s = ("{:.1f}".format(x)).replace(".5", ",5").rstrip("0").rstrip(",")
+                covered_nums.add(s)
                 x += 0.5
         except Exception:
             pass
@@ -295,9 +279,9 @@ def pick_sizes_line(lines: List[str]) -> str:
             continue
         if re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I):
             continue
-        # буквенные или числовые (EU/US) + списки через "," или "/"
+        # Допускаем смешанные разделители ',' и '/'
         if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I) or \
-           re.search(rf"\b{SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))*\b", l):
+           re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
             return l
     return ""
 
@@ -313,7 +297,6 @@ def pick_season_line(lines: List[str]) -> str:
 def parse_number_token(token: Optional[str]) -> Optional[float]:
     if not token:
         return None
-    # поддержка 2.950 / 2,950
     return float(token.replace('.', '').replace(',', ''))
 
 def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
@@ -337,7 +320,7 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
         "retail": retail,
         "sizes_line": sizes_line,
         "season_line": season_line,
-        "brand_line": "",  # бренд всегда пустой
+        "brand_line": "",
         "cleaned_text": text,
     }
 
@@ -346,12 +329,11 @@ def template_five_lines(final_price: int,
                         sizes_line: str,
                         season_line: str,
                         brand_line: str) -> str:
-    # 5 строк; бренд не показываем (строка 5 пустая).
     line1 = f"✅ <b>{ceil_price(final_price)}€</b>"
     line2 = f"❌ <b>Retail price {ceil_price(retail)}€</b>"
     line3 = sizes_line or ""
     line4 = season_line or ""
-    line5 = ""  # бренд убран
+    line5 = ""
     lines = [line1, line2, line3, line4, line5]
     cleaned = []
     for s in lines:
@@ -452,7 +434,7 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
         retail=float(data.get("retail", 0.0) or 0.0),
         sizes_line=data.get("sizes_line", "") or "",
         season_line=data.get("season_line", "") or "",
-        brand_line="",  # гарантированно пусто
+        brand_line="",
     )
 
 # ====== ХЕЛПЕР ======
@@ -467,7 +449,6 @@ async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[
     }
 
 # ====== ХЕНДЛЕРЫ ======
-# Одиночное фото
 @router.message(F.photo & (F.media_group_id == None))
 async def handle_single_photo(msg: Message):
     seq = alloc_seq()
@@ -484,7 +465,6 @@ async def handle_single_photo(msg: Message):
     except Exception:
         pass
 
-# Одиночное видео
 @router.message(F.video & (F.media_group_id == None))
 async def handle_single_video(msg: Message):
     seq = alloc_seq()
@@ -501,13 +481,11 @@ async def handle_single_video(msg: Message):
     except Exception:
         pass
 
-# Альбом (фото/видео вперемешку)
 @router.message(F.media_group_id)
 async def handle_album_any(msg: Message):
     chat_id, mgid = msg.chat.id, str(msg.media_group_id)
     key = (chat_id, mgid)
 
-    # Тип и file_id
     if msg.photo:
         fid = msg.photo[-1].file_id
         kind = "photo"
@@ -522,23 +500,19 @@ async def handle_album_any(msg: Message):
 
     buf = album_buffers.get(key)
     if not buf:
-        # Жёстко закрепляем seq и first_mid по первому апдейту альбома
         seq = alloc_seq()
         buf = {"items": [], "caption": "", "task": None, "user_id": msg.from_user.id, "seq": seq, "first_mid": msg.message_id}
         album_buffers[key] = buf
 
-    # НИЧЕГО НЕ ПЕРЕСТАВЛЯЕМ — просто копим кадры с их mid
     buf["items"].append({"kind": kind, "fid": fid, "mid": msg.message_id, "cap": has_cap})
     if has_cap and not buf["caption"]:
-        buf["caption"] = cap_text  # подпись возьмём, но порядок кадров не трогаем
+        buf["caption"] = cap_text
 
-    # Перезапускаем таймер сброса
     if buf["task"]:
         buf["task"].cancel()
 
     async def _flush_album():
         await asyncio.sleep(ALBUM_SETTLE_MS / 1000)
-
         data = album_buffers.pop(key, None)
         if not data:
             return
@@ -549,7 +523,6 @@ async def handle_album_any(msg: Message):
         seq = data["seq"]
         first_mid = data["first_mid"]
 
-        # Строго сортируем по mid (это и есть исходный порядок от Telegram)
         items.sort(key=lambda x: x["mid"])
 
         if caption:
@@ -560,19 +533,16 @@ async def handle_album_any(msg: Message):
             await publish_to_target(seq, first_mid, user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{caption}")
             return
 
-        # НЕТ подписи — публикуем альбом СРАЗУ без текста
         await publish_to_target(seq, first_mid, user_id, items, "")
         return
 
     buf["task"] = asyncio.create_task(_flush_album())
 
-# Текст после медиа/альбома
 @router.message(F.text)
 async def handle_text(msg: Message):
     chat_id = msg.chat.id
     bucket = last_media.get(chat_id)
 
-    # Текст к одиночному медиа
     if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
         user_id = bucket.get("user_id") or msg.from_user.id
         seq = bucket.get("seq", alloc_seq())
@@ -583,7 +553,6 @@ async def handle_text(msg: Message):
 
         result = build_result_text(user_id, raw_text)
         items: List[Dict[str, Any]] = bucket.get("items") or []
-
         first_mid = min(it["mid"] for it in items) if items else msg.message_id
 
         if result:
@@ -594,7 +563,6 @@ async def handle_text(msg: Message):
         del last_media[chat_id]
         return
 
-    # Текст после ещё не закрытого альбома
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
@@ -608,7 +576,6 @@ async def handle_text(msg: Message):
             caption += "\n"
         caption += (msg.text or "")
 
-        # Исходный порядок кадров — только по mid, НИЧЕГО не переносим
         items.sort(key=lambda x: x["mid"])
 
         user_id = data.get("user_id") or msg.from_user.id
@@ -626,7 +593,7 @@ async def handle_text(msg: Message):
             await publish_to_target(seq, first_mid, user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
         return
 
-    # Чистые тексты (без цены/скидки) — переслать как есть, сохраняя порядок очереди
+    # Чистые тексты — переслать как есть
     txt = msg.text or ""
     has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"-(\d+)\s?%", txt))
     if not has_price:
