@@ -97,10 +97,14 @@ if OCR_ENABLED:
     except Exception:
         OCR_ENABLED = False
 
+def _price_token_regex() -> str:
+    # "€123", "€ 2.950", "2,950 €", "2950€" — поддержка разделителей тысяч . или ,
+    return r"(?:€\s*\d{2,3}(?:[.,]\d{3})*|\d{2,3}(?:[.,]\d{3})*\s*€)"
+
 async def ocr_should_hide(file_id: str) -> bool:
     """
     Прятать ли фото-ценник (видео не трогаем).
-    Строго: должен быть явный токен цены (либо '€123', либо '123€') И
+    Строго: должен быть явный токен цены (либо '€123', либо '123€', с тысячными разделителями) И
     рядом с этим кадром должны встречаться ключевые слова (retail/price/prezzo) или знак процента.
     Это резко уменьшает ложные срабатывания.
     """
@@ -117,8 +121,8 @@ async def ocr_should_hide(file_id: str) -> bool:
         txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
         tl = txt.lower()
 
-        has_price_token = bool(re.search(r"(?:€\s*\d{2,6}|\d{2,6}\s*€)", txt))
-        has_kw = ("retail" in tl) or ("price" in tl) or ("prezzo" in tl) or ("%” in txt) or ("%" in txt)
+        has_price_token = bool(re.search(_price_token_regex(), txt))
+        has_kw = ("retail" in tl) or ("price" in tl) or ("prezzo" in tl) or ("%" in txt)
 
         return bool(has_price_token and has_kw)
     except Exception:
@@ -202,7 +206,6 @@ def extract_sizes_anywhere(text: str) -> str:
             used.add(token)
 
     # Добавляем одиночные числовые, но не те, что уже покрыты диапазонами
-    # (например, если есть 40-44, не добавляем отдельно 40, 41, 42, 43, 44)
     covered_nums = set()
     for a, b in ranges:
         a, b = int(a), int(b)
