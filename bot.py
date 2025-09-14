@@ -1,6 +1,6 @@
 # bot.py — альбомы, 30+ режимов, OCR ценника, дебаунс 1.5с для альбомов,
 # подсказки при отсутствии цены и поддержка "альбом/фото/видео → общий текст"
-# + Строгая гарантия порядка публикаций через GLOBAL SEQ-барьер
+# + Строгая гарантия порядка публикаций через GLOBAL SEQ-барьер (по message_id)
 # Версия с 5-строчной подписью, точным парсингом размеров/сезона,
 # и двумя режимами: /lux (OCR off) и /luxocr (OCR on), одинаковая формула.
 # Округление всегда вверх; бренд из подписи удалён.
@@ -11,6 +11,7 @@ import re
 import io
 import math
 import asyncio
+import heapq
 from typing import Dict, Callable, Optional, List, Tuple, Any
 from datetime import datetime, timedelta
 
@@ -47,18 +48,15 @@ last_media: Dict[int, Dict[str, Any]] = {}
 active_mode: Dict[int, str] = {}
 album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
-# ====== STRICT GLOBAL SEQ (без обгонов между постами) ======
-_next_seq = 0
-_next_to_publish = 1
-_pending: Dict[int, Tuple[int, int, int, List[Dict[str, Any]], str, bool]] = {}  # seq -> payload
-
-def alloc_seq() -> int:
-    global _next_seq
-    _next_seq += 1
-    return _next_seq
-
-# Очередь событий (не приоритетная)
+# ====== ГЛОБАЛЬНЫЙ ПОРЯДОК ПО message_id (min-heap) ======
+# payload: (seq, first_mid, user_id, items, caption, album_ocr_on)
 publish_queue: "asyncio.Queue[Tuple[int, int, int, List[Dict[str, Any]], str, bool]]" = asyncio.Queue()
+_heap: List[Tuple[int, int, Tuple[int, int, int, List[Dict[str, Any]], str, bool]]] = []
+_heap_tie = 0  # чтобы различать одинаковые seq (на всякий случай)
+
+def calc_seq_by_first_mid(first_mid: int) -> int:
+    # Используем message_id самого раннего сообщения как глобальный порядок.
+    return int(first_mid)
 
 def is_ocr_enabled_for(user_id: int) -> bool:
     """
@@ -88,12 +86,11 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
                 message_id=it["mid"],
             )
         except Exception:
-            # fallback: если форвард не удался — отправим caption (если есть)
             if caption:
                 await bot.send_message(TARGET_CHAT_ID, caption)
         return
 
-    # текстовый пост «как есть»
+    # Текстовый пост «как есть»
     if items and items[0].get("kind") == "text":
         await bot.send_message(TARGET_CHAT_ID, caption or "")
         return
@@ -109,7 +106,7 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
             await bot.send_photo(TARGET_CHAT_ID, it["fid"], caption=caption)
         return
 
-    # Альбом: подпись к первому
+    # Альбом: подпись на первом
     first = items[0]
     media = []
     if first["kind"] == "video":
@@ -121,25 +118,26 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
     await bot.send_media_group(TARGET_CHAT_ID, media)
 
 async def publish_worker():
-    global _next_to_publish
+    global _heap_tie
     while True:
         payload = await publish_queue.get()
         seq = payload[0]
-        _pending[seq] = payload
+        _heap_tie += 1
+        heapq.heappush(_heap, (seq, _heap_tie, payload))
         publish_queue.task_done()
 
-        # Публикуем строго по seq
-        while _next_to_publish in _pending:
-            s, first_mid, user_id, items, caption, album_ocr_on = _pending.pop(_next_to_publish)
+        # Выпускаем всё, что есть, по возрастанию seq
+        while _heap:
+            _, _, pl = heapq.heappop(_heap)
+            _seq, first_mid, user_id, items, caption, album_ocr_on = pl
             try:
                 await _do_publish(user_id, items, caption, album_ocr_on)
             except Exception:
                 pass
-            finally:
-                _next_to_publish += 1
 
-async def publish_to_target(seq: int, first_mid: int, user_id: int, items: List[Dict[str, Any]], caption: str):
+async def publish_to_target(first_mid: int, user_id: int, items: List[Dict[str, Any]], caption: str):
     album_ocr_on = is_ocr_enabled_for(user_id)
+    seq = calc_seq_by_first_mid(first_mid)
     await publish_queue.put((seq, first_mid, user_id, items, caption, album_ocr_on))
 
 # ====== OCR ======
@@ -286,26 +284,24 @@ def extract_sizes_anywhere(text: str) -> str:
             continue
         add(norm)
 
-    # --- Антишум: теперь НЕ отбрасываем одиночный реальный размер ---
+    # --- Антишум: одиночный реальный размер не выбрасываем ---
     evidence_of_ranges = bool(ranges_dash or ranges_slash)
     has_alpha = bool(singles_alpha)
-
     if not evidence_of_ranges and not has_alpha:
         only_nums = [p for p in parts if re.fullmatch(r"\d+(?:,\d)?", p)]
         if len(only_nums) == 1:
-            # если это явный размер (EU 30–46 или US 5–12), оставляем
             val = only_nums[0].replace(",", ".")
             try:
                 f = float(val)
                 is_eu = 30.0 <= f <= 46.0
-                is_us = 5.0 <= f <= 12.0
+                is_us = 5.0  <= f <= 12.0
                 if not (is_eu or is_us):
                     return ""
             except Exception:
                 return ""
         elif len(only_nums) == 0:
             return ""
-    # ----------------------------------------------------------------
+    # ----------------------------------------------------------
 
     return ", ".join(parts)
 
@@ -349,7 +345,7 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
 
     price_m    = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
     discount_m = re.search(r"-(\d+)%", text)
-    retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)  # FIX \d
+    retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
 
     price    = parse_number_token(price_m.group(1)) if price_m else None
     discount = int(discount_m.group(1)) if discount_m else 0
@@ -482,28 +478,26 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
     )
 
 # ====== ХЕЛПЕР ======
-async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[str, Any]], mgid: Optional[str] = None, caption: str = "", seq: Optional[int] = None):
+async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[str, Any]], first_mid: int, caption: str = ""):
     last_media[chat_id] = {
         "ts": datetime.now(),
         "items": items,
         "caption": caption or "",
-        "mgid": mgid or "",
         "user_id": user_id,
-        "seq": seq if seq is not None else alloc_seq(),
+        "first_mid": first_mid,
     }
 
 # ====== ХЕНДЛЕРЫ ======
 @router.message(F.photo & (F.media_group_id == None))
 async def handle_single_photo(msg: Message):
-    seq = alloc_seq()
     item = {"kind": "photo", "fid": msg.photo[-1].file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
     if caption:
         result = build_result_text(msg.from_user.id, caption)
         if result:
-            await publish_to_target(seq, item["mid"], msg.from_user.id, [item], result)
+            await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=[item], caption=result)
             return
-    await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], caption=caption, seq=seq)
+    await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], first_mid=msg.message_id, caption=caption)
     try:
         await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую одним постом.")
     except Exception:
@@ -511,15 +505,14 @@ async def handle_single_photo(msg: Message):
 
 @router.message(F.video & (F.media_group_id == None))
 async def handle_single_video(msg: Message):
-    seq = alloc_seq()
     item = {"kind": "video", "fid": msg.video.file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
     if caption:
         result = build_result_text(msg.from_user.id, caption)
         if result:
-            await publish_to_target(seq, item["mid"], msg.from_user.id, [item], result)
+            await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=[item], caption=result)
             return
-    await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], caption=caption, seq=seq)
+    await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], first_mid=msg.message_id, caption=caption)
     try:
         await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую одним постом.")
     except Exception:
@@ -544,8 +537,7 @@ async def handle_album_any(msg: Message):
 
     buf = album_buffers.get(key)
     if not buf:
-        seq = alloc_seq()
-        buf = {"items": [], "caption": "", "task": None, "user_id": msg.from_user.id, "seq": seq, "first_mid": msg.message_id}
+        buf = {"items": [], "caption": "", "task": None, "user_id": msg.from_user.id, "first_mid": msg.message_id}
         album_buffers[key] = buf
 
     buf["items"].append({"kind": kind, "fid": fid, "mid": msg.message_id, "cap": has_cap})
@@ -564,7 +556,6 @@ async def handle_album_any(msg: Message):
         items: List[Dict[str, Any]] = data["items"]
         caption = data["caption"]
         user_id = data["user_id"]
-        seq = data["seq"]
         first_mid = data["first_mid"]
 
         items.sort(key=lambda x: x["mid"])
@@ -572,12 +563,13 @@ async def handle_album_any(msg: Message):
         if caption:
             result = build_result_text(user_id, caption)
             if result:
-                await publish_to_target(seq, first_mid, user_id, items, result)
+                await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption=result)
                 return
-            await publish_to_target(seq, first_mid, user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{caption}")
+            await publish_to_target(first_mid=first_mid, user_id=user_id, items=items,
+                                    caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{caption}")
             return
 
-        await publish_to_target(seq, first_mid, user_id, items, "")
+        await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption="")
         return
 
     buf["task"] = asyncio.create_task(_flush_album())
@@ -589,9 +581,8 @@ async def handle_text(msg: Message):
     has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"-(\d+)\s?%", txt))
     has_custom = any(e.type == MessageEntityType.CUSTOM_EMOJI for e in (msg.entities or []))
     if not has_price and has_custom:
-        seq = alloc_seq()
         fwd_item = [{"kind": "forward", "from_chat_id": msg.chat.id, "mid": msg.message_id, "cap": True}]
-        await publish_to_target(seq, msg.message_id, msg.from_user.id, fwd_item, "")
+        await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=fwd_item, caption="")
         return
     # ======================================================
 
@@ -600,7 +591,6 @@ async def handle_text(msg: Message):
 
     if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
         user_id = bucket.get("user_id") or msg.from_user.id
-        seq = bucket.get("seq", alloc_seq())
         raw_text = (bucket.get("caption") or "")
         if raw_text:
             raw_text += "\n"
@@ -608,16 +598,18 @@ async def handle_text(msg: Message):
 
         result = build_result_text(user_id, raw_text)
         items: List[Dict[str, Any]] = bucket.get("items") or []
-        first_mid = min(it["mid"] for it in items) if items else msg.message_id
+        first_mid = bucket.get("first_mid") or (min(it["mid"] for it in items) if items else msg.message_id)
 
         if result:
-            await publish_to_target(seq, first_mid, user_id, items, result)
+            await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption=result)
         else:
-            await publish_to_target(seq, first_mid, user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
+            await publish_to_target(first_mid=first_mid, user_id=user_id, items=items,
+                                    caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
 
         del last_media[chat_id]
         return
 
+    # Привязка текста к самому свежему альбому этого чата (если ещё «дышит»)
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
@@ -634,7 +626,6 @@ async def handle_text(msg: Message):
         items.sort(key=lambda x: x["mid"])
 
         user_id = data.get("user_id") or msg.from_user.id
-        seq = data.get("seq", alloc_seq())
         first_mid = data.get("first_mid", items[0]["mid"] if items else msg.message_id)
         result = build_result_text(user_id, caption)
 
@@ -643,16 +634,16 @@ async def handle_text(msg: Message):
         album_buffers.pop(key, None)
 
         if result:
-            await publish_to_target(seq, first_mid, user_id, items, result)
+            await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption=result)
         else:
-            await publish_to_target(seq, first_mid, user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
+            await publish_to_target(first_mid=first_mid, user_id=user_id, items=items,
+                                    caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
         return
 
     # Чистые тексты без цены и без custom_emoji — отправляем как текст
     if not has_price:
-        seq = alloc_seq()
         text_item = [{"kind": "text", "fid": "", "mid": msg.message_id, "cap": True}]
-        await publish_to_target(seq, msg.message_id, msg.from_user.id, text_item, txt)
+        await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=text_item, caption=txt)
         return
 
     return
