@@ -98,7 +98,7 @@ if OCR_ENABLED:
         OCR_ENABLED = False
 
 async def ocr_should_hide(file_id: str) -> bool:
-    """Прятать ли фото-ценник (видео не трогаем)."""
+    """Строгий детектор ценника для фото."""
     if not OCR_ENABLED:
         return False
     try:
@@ -112,14 +112,13 @@ async def ocr_should_hide(file_id: str) -> bool:
         txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
         tl = txt.lower()
 
-        # Более строгий фильтр:
+        # Признаки: валюта + «длинное» число + (скидка % или слово price/prezzo/retail)
         has_euro = ("€" in txt) or (" eur" in tl) or ("eur " in tl)
-        has_kw   = ("retail" in tl) or ("price" in tl) or ("prezzo" in tl)
+        has_kw   = ("retail price" in tl) or ("prezzo" in tl) or (" price" in tl) or ("retail" in tl)
         has_pct  = "%" in txt
-        long_num = bool(re.search(r"\b\d{3,6}\b", txt))  # 750, 1680, 12500 и т.п.
+        long_num = bool(re.search(r"\b\d{3,5}\b", txt))  # 750, 1900, 12500 и т.п.
 
-        # Прячем ТОЛЬКО если прям явно ценник
-        return bool(has_euro and long_num and (has_kw or has_pct))
+        return bool(has_euro and long_num and (has_pct or has_kw))
     except Exception:
         return False
 
@@ -160,72 +159,111 @@ def default_calc(price: float, discount: int) -> int:
     else:
         return round_price(discounted + 90)
 
-# ==== ШАБЛОН БЕЗ ЛЮБЫХ МЕТОК (SALE и т.п.) ====
-def default_template(final_price: int, retail: float, sizes: str, season: str, mode_label: Optional[str] = None) -> str:
-    return (
-        f"✅ <b>{final_price}€</b>\n"
-        f"❌ <b>Retail price {round_price(retail)}€</b>\n"
-        f"{sizes}\n"
-        f"{season}"
-    ).strip()
+# ====== РАЗБОР И ФОРМИРОВАНИЕ 5-СТРОЧНОЙ ПОДПИСИ ======
 
+# Удаляем только хештеги, ничего больше
 def cleanup_text_basic(text: str) -> str:
-    text = re.sub(r"#\w+", "", text)
-    text = re.sub(r"(?i)\b(Gucci|Prada|Louis\s*Vuitton|LV|Stone\s*Island|Balenciaga|Bally|Jimmy\s*Choo)\b", "", text)
+    text = re.sub(r"#\S+", "", text)  # убрать #теги
+    # нормализуем пробелы/пустые строки
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# -------- Размеры: буквенные и числовые, без цен/скидок/сезонов --------
+# поддержка размеров: буквы и/или цифры (диапазоны и списки)
 SIZE_TOKEN = r"(?:XXS|XS|S|M|L|XL|XXL|[2-5]\d)"
-EXCLUDE_FOR_SIZES = re.compile(
-    r"(€|%|\bFW\d+(?:/\d+)?\b|\bSS\d+(?:/\d+)?\b|\bNEW\b|\bRETAIL\b|\bPRICE\b|\bPREZZO\b|#)",
-    flags=re.I
-)
 
-def parse_sizes_line(text: str) -> str:
-    """
-    Возвращает строку с размерами (XS…XXL, 38, 40–44, '40( на мне), 44').
-    Игнорируем строки с ценой/скидкой/сезоном/хэштегами.
-    """
-    candidates: List[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
+def pick_sizes_line(lines: List[str]) -> str:
+    for line in lines:
+        l = line.strip()
+        if not l:
             continue
-        if EXCLUDE_FOR_SIZES.search(line):
+        # не брать строки с ценой/скидкой/ретейлом/валютой
+        if re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I):
             continue
-        # буквенные/числовые + диапазоны/через запятую
-        if re.search(fr"\b{SIZE_TOKEN}\b(?:\s*(?:[-–—]|to|,)\s*\b{SIZE_TOKEN}\b)*", line, flags=re.I):
-            candidates.append(line)
+        if re.search(fr"\b{SIZE_TOKEN}\b", l, flags=re.I):
+            return l
         # варианты вида "40( на мне), 44"
-        elif re.search(r"\b[2-5]\d\b(?:\s*\([^)]+\))?(?:\s*,\s*\b[2-5]\d\b(?:\s*\([^)]+\))?)*", line):
-            candidates.append(line)
-    return candidates[0] if candidates else ""
+        if re.search(r"\b[2-5]\d\b(?:\s*\([^)]+\))?(?:\s*,\s*\b[2-5]\d\b(?:\s*\([^)]+\))?)*", l):
+            return l
+    return ""
 
-def parse_input(text: str) -> Dict[str, Optional[str]]:
-    # поддержка 2.950€ и 2,950€
+def pick_season_line(lines: List[str]) -> str:
+    for line in lines:
+        if re.search(r"\bNEW\s+(FW|SS)", line, flags=re.I):
+            return line.strip()
+    return ""
+
+def pick_brand_line(lines: List[str], used: List[str]) -> str:
+    """
+    Берём первую строку, которая не используется под цену/ретейл/размер/сезон,
+    не содержит %/€/retail/price и выглядит как название (минимум одно слово с буквой).
+    """
+    used_set = set(used)
+    for line in lines:
+        l = line.strip()
+        if not l or l in used_set:
+            continue
+        if re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I):
+            continue
+        # избегаем случайных «служебных» строк
+        if re.search(fr"\b{SIZE_TOKEN}\b", l, flags=re.I):
+            continue
+        if re.search(r"\bNEW\s+(FW|SS)", l, flags=re.I):
+            continue
+        if re.search(r"[A-Za-zА-Яа-яЁё]", l):
+            return l
+    return ""
+
+def parse_number_token(token: Optional[str]) -> Optional[float]:
+    if not token:
+        return None
+    # поддержка 2.950 / 2,950
+    return float(token.replace('.', '').replace(',', ''))
+
+def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
+    text = cleanup_text_basic(raw_text)
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    # 1) цена/скидка/ретейл
     price_m   = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
     discount_m= re.search(r"-(\d+)%", text)
     retail_m  = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
-    sizes     = parse_sizes_line(text)
-    season_m  = re.search(r"(FW\d+\/\d+|SS\d+)", text, flags=re.I)
 
-    def num(x: Optional[str]) -> Optional[float]:
-        if not x:
-            return None
-        # 2.950 -> 2950 ; 2,950 -> 2950
-        return float(x.replace('.', '').replace(',', ''))
-
-    price   = num(price_m.group(1)) if price_m else None
+    price   = parse_number_token(price_m.group(1)) if price_m else None
     discount= int(discount_m.group(1)) if discount_m else 0
-    retail  = num(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
-    season  = season_m.group(1).upper() if season_m else ""
-    return {"price": price, "discount": discount, "retail": retail, "sizes": sizes, "season": season}
+    retail  = parse_number_token(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
+
+    # 2) размеры/сезон/бренд — строками
+    sizes_line  = pick_sizes_line(lines)
+    season_line = pick_season_line(lines)
+    brand_line  = pick_brand_line(lines, used=[sizes_line, season_line])
+
+    return {
+        "price": price,
+        "discount": discount,
+        "retail": retail,
+        "sizes_line": sizes_line,
+        "season_line": season_line,
+        "brand_line": brand_line,
+        "cleaned_text": text,
+    }
+
+def template_five_lines(final_price: int,
+                        retail: float,
+                        sizes_line: str,
+                        season_line: str,
+                        brand_line: str) -> str:
+    # Строго 5 строк; если чего-то нет — оставляем пустую строку на своём месте
+    line1 = f"✅ <b>{final_price}€</b>"
+    line2 = f"❌ <b>Retail price {round_price(retail)}€</b>"
+    line3 = sizes_line or ""
+    line4 = season_line or ""
+    line5 = brand_line or ""
+    return "\n".join([line1, line2, line3, line4, line5])
 
 def mk_mode(label: str,
             calc: Callable[[float, int], int] = default_calc,
-            template: Callable[[int, float, str, str, Optional[str]], str] = default_template):
+            template: Callable[[int, float, str, str, str], str] = template_five_lines):
     return {"label": label, "calc": calc, "template": template}
 
 MODES: Dict[str, Dict] = {
@@ -288,16 +326,20 @@ async def ping(msg: Message):
 
 # ====== СБОРКА ПОДПИСИ ======
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
-    cleaned = cleanup_text_basic(caption)
-    data = parse_input(cleaned)
+    data = parse_input(caption)
     price = data.get("price")
     if price is None:
         return None
     mode = MODES.get(active_mode.get(user_id, "sale"), MODES["sale"])
     calc_fn, tpl_fn, _label = mode["calc"], mode["template"], mode["label"]
-    final_price = calc_fn(price, data.get("discount", 0))
-    # Не передаём mode_label — никаких меток в постах
-    return tpl_fn(final_price, data["retail"], data["sizes"], data["season"], mode_label=None)
+    final_price = calc_fn(float(price), int(data.get("discount", 0)))
+    return tpl_fn(
+        final_price=final_price,
+        retail=float(data.get("retail", 0.0) or 0.0),
+        sizes_line=data.get("sizes_line", "") or "",
+        season_line=data.get("season_line", "") or "",
+        brand_line=data.get("brand_line", "") or "",
+    )
 
 # ====== ХЕЛПЕРЫ ======
 async def _remember_media_for_text(chat_id: int, items: List[Dict[str, Any]], mgid: Optional[str] = None, caption: str = ""):
@@ -432,4 +474,39 @@ async def handle_text(msg: Message):
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
         cand.sort(key=lambda kv: last_mid(kv[1]))
-        eligible =
+        eligible = [kv for kv in cand if last_mid(kv[1]) <= msg.message_id]
+        key, data = (eligible[-1] if eligible else cand[-1])
+
+        items: List[Dict[str, Any]] = data["items"]
+        caption = (data.get("caption") or "")
+        if caption:
+            caption += "\n"
+        caption += (msg.text or "")
+
+        items.sort(key=lambda x: x["mid"])
+        idx_cap = next((i for i, it in enumerate(items) if it["cap"]), None)
+        if idx_cap not in (None, 0):
+            items.insert(0, items.pop(idx_cap))
+
+        result = build_result_text(user_id, caption)
+
+        if data.get("task"):
+            data["task"].cancel()
+        album_buffers.pop(key, None)
+
+        if result:
+            await publish_to_target(items, result)
+        else:
+            await publish_to_target(items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
+        return
+
+    return
+
+# ====== ЗАПУСК ======
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    asyncio.create_task(publish_worker())
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+if __name__ == "__main__":
+    asyncio.run(main())
