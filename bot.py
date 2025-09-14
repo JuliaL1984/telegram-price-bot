@@ -59,7 +59,7 @@ def is_ocr_enabled_for(user_id: int) -> bool:
     """
     /lux      -> OCR off для альбомов
     /luxocr   -> OCR on  для альбомов
-    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALBUMS
+    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALБOMS
     """
     mode = active_mode.get(user_id, "sale")
     if mode == "lux":
