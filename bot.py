@@ -168,8 +168,8 @@ async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool)
 
 # ====== КАЛЬКУЛЯТОРЫ ======
 def ceil_price(value: float) -> int:
-    """Всегда вверх до целого евро."""
-    return int(math.ceil(value))
+    """Всегда вверх до целого евро (с защитой от 959.999999)."""
+    return int(math.ceil(value - 1e-9))
 
 def default_calc(price: float, discount: int) -> int:
     """Базовый калькулятор для остальных режимов."""
@@ -332,7 +332,7 @@ def mk_mode(label: str,
             template: Callable[[int, float, str, str, str], str] = template_five_lines):
     return {"label": label, "calc": calc, "template": template}
 
-# ====== РЕЖИМы ======
+# ====== РЕЖИМЫ ======
 MODES: Dict[str, Dict] = {
     "sale": mk_mode("SALE"),
     "lux": mk_mode("LUX", calc=lux_calc),          # OCR off
