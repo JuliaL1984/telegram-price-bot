@@ -30,9 +30,10 @@ ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
+
 # Базовая политика: в альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
-FILTER_PRICETAGS_IN_ALBUMС = os.getenv("FILTER_PRICETAGS_IN_ALBUMС")
-FILTER_PRICETAGS_IN_ALBUMS = (FILTER_PRICETAGS_IN_ALBUMС == "1") if FILTER_PRICETAGS_IN_ALБУМС is not None else (os.getenv("FILTER_PRICETAGS_IN_ALBUMS","1")=="1")
+# ВАЖНО: только латиница в названии env переменной
+FILTER_PRICETAGS_IN_ALBUMS = os.getenv("FILTER_PRICETAGS_IN_ALBUMS", "1") == "1"
 
 # ====== ИНИЦИАЛИЗАЦИЯ ======
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -77,7 +78,7 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
     if not items:
         return
 
-    # >>> NEW: форвард оригинала — сохраняет активные эмодзи/эффекты
+    # Форвард оригинала — сохраняет активные эмодзи/эффекты
     if items and items[0].get("kind") == "forward":
         it = items[0]
         try:
@@ -91,7 +92,6 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
             if caption:
                 await bot.send_message(TARGET_CHAT_ID, caption)
         return
-    # <<< NEW
 
     # текстовый пост «как есть»
     if items and items[0].get("kind") == "text":
@@ -286,12 +286,11 @@ def extract_sizes_anywhere(text: str) -> str:
             continue
         add(norm)
 
-    # >>> tweak: игнорируем единственное число, чтобы не ловить «6» как размер
+    # игнорируем единственное число, чтобы не ловить «6» как размер
     evidence_of_ranges = bool(ranges_dash or ranges_slash)
     has_alpha = bool(singles_alpha)
     if not evidence_of_ranges and not has_alpha and len([p for p in parts if re.fullmatch(r"\d+(?:,\d)?", p)]) == 1:
         return ""
-    # <<< tweak
 
     return ", ".join(parts)
 
@@ -617,7 +616,7 @@ async def handle_text(msg: Message):
             await publish_to_target(seq, first_mid, user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
         return
 
-    # >>> NEW: чистые тексты — форвардим оригинал, чтобы эмодзи остались активными
+    # Чистые тексты — форвардим оригинал, чтобы эмодзи остались активными
     txt = msg.text or ""
     has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"-(\d+)\s?%", txt))
     if not has_price:
@@ -625,7 +624,6 @@ async def handle_text(msg: Message):
         fwd_item = [{"kind": "forward", "from_chat_id": msg.chat.id, "mid": msg.message_id, "cap": True}]
         await publish_to_target(seq, msg.message_id, msg.from_user.id, fwd_item, "")
         return
-    # <<< NEW
 
     return
 
