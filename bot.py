@@ -1,6 +1,7 @@
-# bot.py — альбомы, 30+ режимов, OCR ценника, дебаунс 0.8с для альбомов,
+# bot.py — альбомы, 30+ режимов, OCR ценника, дебаунс 1.5с для альбомов,
 # подсказки при отсутствии цены и поддержка "альбом/фото/видео → общий текст"
 # + Гарантия порядка публикаций через FIFO-очередь
+# Версия с 5-строчной подписью и точным парсингом размеров/сезона/бренда
 
 import os
 import re
@@ -20,7 +21,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002973176038"))
 ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "800"))
+ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "1500"))  # было 800
 ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
@@ -81,8 +82,7 @@ async def publish_worker():
         try:
             await _do_publish(items, caption)
         except Exception:
-            # не блокируем очередь из-за ошибки одного сообщения
-            pass
+            pass  # не блокируем очередь из-за ошибки одного сообщения
         finally:
             publish_queue.task_done()
 
@@ -98,7 +98,12 @@ if OCR_ENABLED:
         OCR_ENABLED = False
 
 async def ocr_should_hide(file_id: str) -> bool:
-    """Прятать ли фото-ценник (видео не трогаем). Строго: видим € и число РЯДОМ + (% или retail/price/prezzo)."""
+    """
+    Прятать ли фото-ценник (видео не трогаем).
+    Строго: должен быть явный токен цены (либо '€123', либо '123€') И
+    рядом с этим кадром должны встречаться ключевые слова (retail/price/prezzo) или знак процента.
+    Это резко уменьшает ложные срабатывания.
+    """
     if not OCR_ENABLED:
         return False
     try:
@@ -112,9 +117,8 @@ async def ocr_should_hide(file_id: str) -> bool:
         txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
         tl = txt.lower()
 
-        # точный токен цены: "€123" или "123€"
         has_price_token = bool(re.search(r"(?:€\s*\d{2,6}|\d{2,6}\s*€)", txt))
-        has_kw = ("retail" in tl) or ("price" in tl) or ("prezzo" in tl) or ("%" in txt)
+        has_kw = ("retail" in tl) or ("price" in tl) or ("prezzo" in tl) or ("%” in txt) or ("%" in txt)
 
         return bool(has_price_token and has_kw)
     except Exception:
@@ -161,15 +165,70 @@ def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# Поддержка размеров: буквы и/или цифры (диапазоны и списки)
+# Токены размеров: буквенные и/или цифры (38–46 и т.п.)
 SIZE_TOKEN = r"(?:XXS|XS|S|M|L|XL|XXL|[2-5]\d)"
 
+def _strip_seasons_for_size_scan(text: str) -> str:
+    """Убираем все подстроки вида NEW FW25/26, FW25/26, SS25 и т.п., чтобы цифры 25/26 не считались размерами."""
+    return re.sub(r"\b(?:NEW\s+)?(?:FW|SS)\d+(?:/\d+)?\b", " ", text, flags=re.I)
+
+def extract_sizes_anywhere(text: str) -> str:
+    """
+    Вытягиваем размеры из любого места текста, даже если они стоят на одной строке с ценой.
+    Игнорируем все сезоны (FW/SS...), чтобы не спутать 25/26 с размером.
+    Сохраняем исходный порядок и удаляем дубликаты.
+    """
+    work = _strip_seasons_for_size_scan(text)
+    # Собираем диапазоны "40-44", одиночные числа "38", и буквенные "XS" и т.д.
+    ranges = re.findall(r"\b([2-5]\d)\s*[-–—]\s*([2-5]\d)\b", work)
+    singles_num = re.findall(r"\b([2-5]\d)\b", work)
+    singles_alpha = re.findall(r"\b(XXS|XS|S|M|L|XL|XXL)\b", work, flags=re.I)
+
+    parts: List[str] = []
+    used = set()
+
+    # Добавляем диапазоны как в исходном виде
+    for a, b in ranges:
+        token = f"{a}-{b}"
+        if token not in used:
+            parts.append(token)
+            used.add(token)
+
+    # Добавляем буквенные
+    for t in singles_alpha:
+        token = t.upper()
+        if token not in used:
+            parts.append(token)
+            used.add(token)
+
+    # Добавляем одиночные числовые, но не те, что уже покрыты диапазонами
+    # (например, если есть 40-44, не добавляем отдельно 40, 41, 42, 43, 44)
+    covered_nums = set()
+    for a, b in ranges:
+        a, b = int(a), int(b)
+        if a <= b:
+            covered_nums.update(str(x) for x in range(a, b + 1))
+        else:
+            covered_nums.update(str(x) for x in range(b, a + 1))
+
+    for t in singles_num:
+        if t in covered_nums:
+            continue
+        if t not in used:
+            parts.append(t)
+            used.add(t)
+
+    return ", ".join(parts)
+
 def pick_sizes_line(lines: List[str]) -> str:
+    """
+    Предпочтительно берём отдельную строку с размерами без €/%/retail/price.
+    Если не нашли — fallback: собираем размеры из всего текста.
+    """
     for line in lines:
         l = line.strip()
         if not l:
             continue
-        # не брать строки с ценой/скидкой/ретейлом/валютой
         if re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I):
             continue
         if re.search(fr"\b{SIZE_TOKEN}\b", l, flags=re.I):
@@ -194,7 +253,7 @@ def pick_brand_line(lines: List[str], used: List[str]) -> str:
     Берём первую строку, которая не используется под цену/ретейл/размер/сезон
     и не выглядит как строка сезона (даже без NEW).
     """
-    used_set = set(used)
+    used_set = set([u for u in used if u])
     for line in lines:
         l = line.strip()
         if not l or l in used_set:
@@ -203,7 +262,6 @@ def pick_brand_line(lines: List[str], used: List[str]) -> str:
             continue
         if re.search(fr"\b{SIZE_TOKEN}\b", l, flags=re.I):
             continue
-        # исключаем любые FW/SS-строки (чтобы не дублировать сезон)
         if re.search(r"\b(?:NEW\s+)?(?:FW|SS)\d+(?:/\d+)?\b", l, flags=re.I):
             continue
         if re.search(r"[A-Za-zА-Яа-яЁё]", l):
@@ -220,7 +278,7 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     text = cleanup_text_basic(raw_text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # 1) цена/скидка/ретейл
+    # 1) цена/скидка/ретейл (цена может быть 2.950€ или 2,950€)
     price_m   = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
     discount_m= re.search(r"-(\d+)%", text)
     retail_m  = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
@@ -231,6 +289,10 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
 
     # 2) размеры/сезон/бренд — строками
     sizes_line  = pick_sizes_line(lines)
+    if not sizes_line:
+        # fallback: соберём из всего текста, исключая сезоны
+        sizes_line = extract_sizes_anywhere(text)
+
     season_line = pick_season_line(lines)
     brand_line  = pick_brand_line(lines, used=[sizes_line, season_line])
 
