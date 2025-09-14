@@ -98,7 +98,7 @@ if OCR_ENABLED:
         OCR_ENABLED = False
 
 async def ocr_should_hide(file_id: str) -> bool:
-    """Строгий детектор ценника для фото."""
+    """Прятать ли фото-ценник (видео не трогаем). Строго: видим € и число РЯДОМ + (% или retail/price/prezzo)."""
     if not OCR_ENABLED:
         return False
     try:
@@ -112,28 +112,21 @@ async def ocr_should_hide(file_id: str) -> bool:
         txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
         tl = txt.lower()
 
-        # Признаки: валюта + «длинное» число + (скидка % или слово price/prezzo/retail)
-        has_euro = ("€" in txt) or (" eur" in tl) or ("eur " in tl)
-        has_kw   = ("retail price" in tl) or ("prezzo" in tl) or (" price" in tl) or ("retail" in tl)
-        has_pct  = "%" in txt
-        long_num = bool(re.search(r"\b\d{3,5}\b", txt))  # 750, 1900, 12500 и т.п.
+        # точный токен цены: "€123" или "123€"
+        has_price_token = bool(re.search(r"(?:€\s*\d{2,6}|\d{2,6}\s*€)", txt))
+        has_kw = ("retail" in tl) or ("price" in tl) or ("prezzo" in tl) or ("%" in txt)
 
-        return bool(has_euro and long_num and (has_pct or has_kw))
+        return bool(has_price_token and has_kw)
     except Exception:
         return False
 
 async def filter_pricetag_media(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Одиночные: ничего не удаляем (чтобы не пропустить пост).
+    Одиночные: ничего не удаляем.
     Альбомы: при FILTER_PRICETAGS_IN_ALBUMS=1 — вырезаем ТОЛЬКО кадры-ценники (видео никогда не режем).
-    Порядок сохраняем. Если всё вырезалось — оставим первый исходный, чтобы не «съесть» публикацию.
+    Если всё вырезалось — оставляем первый исходный, чтобы не «съесть» публикацию.
     """
-    # Одиночный файл — не трогаем
-    if len(items) == 1:
-        return items
-
-    # Альбом
-    if not FILTER_PRICETAGS_IN_ALBUMS:
+    if len(items) == 1 or not FILTER_PRICETAGS_IN_ALBUMS:
         return items
 
     kept: List[Dict[str, Any]] = []
@@ -161,15 +154,14 @@ def default_calc(price: float, discount: int) -> int:
 
 # ====== РАЗБОР И ФОРМИРОВАНИЕ 5-СТРОЧНОЙ ПОДПИСИ ======
 
-# Удаляем только хештеги, ничего больше
+# Удаляем только хештеги
 def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"#\S+", "", text)  # убрать #теги
-    # нормализуем пробелы/пустые строки
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# поддержка размеров: буквы и/или цифры (диапазоны и списки)
+# Поддержка размеров: буквы и/или цифры (диапазоны и списки)
 SIZE_TOKEN = r"(?:XXS|XS|S|M|L|XL|XXL|[2-5]\d)"
 
 def pick_sizes_line(lines: List[str]) -> str:
@@ -188,15 +180,19 @@ def pick_sizes_line(lines: List[str]) -> str:
     return ""
 
 def pick_season_line(lines: List[str]) -> str:
+    # сначала ищем строку с NEW FW/SS..., если нет — просто FW/SS...
     for line in lines:
-        if re.search(r"\bNEW\s+(FW|SS)", line, flags=re.I):
+        if re.search(r"\bNEW\s+(?:FW|SS)\d+(?:/\d+)?\b", line, flags=re.I):
+            return line.strip()
+    for line in lines:
+        if re.search(r"\b(?:FW|SS)\d+(?:/\d+)?\b", line, flags=re.I):
             return line.strip()
     return ""
 
 def pick_brand_line(lines: List[str], used: List[str]) -> str:
     """
-    Берём первую строку, которая не используется под цену/ретейл/размер/сезон,
-    не содержит %/€/retail/price и выглядит как название (минимум одно слово с буквой).
+    Берём первую строку, которая не используется под цену/ретейл/размер/сезон
+    и не выглядит как строка сезона (даже без NEW).
     """
     used_set = set(used)
     for line in lines:
@@ -205,10 +201,10 @@ def pick_brand_line(lines: List[str], used: List[str]) -> str:
             continue
         if re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I):
             continue
-        # избегаем случайных «служебных» строк
         if re.search(fr"\b{SIZE_TOKEN}\b", l, flags=re.I):
             continue
-        if re.search(r"\bNEW\s+(FW|SS)", l, flags=re.I):
+        # исключаем любые FW/SS-строки (чтобы не дублировать сезон)
+        if re.search(r"\b(?:NEW\s+)?(?:FW|SS)\d+(?:/\d+)?\b", l, flags=re.I):
             continue
         if re.search(r"[A-Za-zА-Яа-яЁё]", l):
             return l
