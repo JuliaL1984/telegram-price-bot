@@ -62,7 +62,7 @@ def is_ocr_enabled_for(user_id: int) -> bool:
     """
     /lux      -> OCR off для альбомов
     /luxocr   -> OCR on  для альбомов
-    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALBUMS
+    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALБУМС
     """
     mode = active_mode.get(user_id, "sale")
     if mode == "lux":
@@ -72,9 +72,15 @@ def is_ocr_enabled_for(user_id: int) -> bool:
     return FILTER_PRICETAGS_IN_ALBUMS
 
 async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, album_ocr_on: bool):
-    """Реальная отправка сообщений (фото/видео/альбомы)."""
+    """Реальная отправка сообщений (фото/видео/альбомы/текст)."""
     if not items:
         return
+
+    # >>> added: текстовый пост «как есть» (идёт через ту же очередь и сохраняет порядок)
+    if items and items[0].get("kind") == "text":
+        await bot.send_message(TARGET_CHAT_ID, caption or "")
+        return
+    # <<< added
 
     # OCR-фильтрация только для альбомов при album_ocr_on=True (порядок сохраняем)
     items = await filter_pricetag_media(items, album_ocr_on)
@@ -393,7 +399,7 @@ MODES: Dict[str, Dict] = {
     "flash": mk_mode("FLASH"),
     "bundle": mk_mode("BUNDLE"),
     "limited": mk_mode("LIMITED"),
-    "m1": mk_mode("M1"), "m2": mk_mode("M2"), "m3": mk_mode("M3"), "m4": mk_mode("M4"), "m5": mk_mode("M5"),
+    "m1": mk_mode("M1"), "m2": mk_mode("M2"), "m3": mk_mode("M3"), "m4": mk_mode("М4"), "m5": mk_mode("M5"),
 }
 
 def is_admin(user_id: int) -> bool:
@@ -618,6 +624,16 @@ async def handle_text(msg: Message):
         else:
             await publish_to_target(seq, first_mid, user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
         return
+
+    # >>> added: чистые тексты (без цены/скидки) — переслать как есть, сохраняя порядок очереди
+    txt = msg.text or ""
+    has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"-(\d+)\s?%", txt))
+    if not has_price:
+        seq = alloc_seq()
+        text_item = [{"kind": "text", "fid": "", "mid": msg.message_id, "cap": True}]
+        await publish_to_target(seq, msg.message_id, msg.from_user.id, text_item, txt)
+        return
+    # <<< added
 
     return
 
