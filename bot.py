@@ -112,9 +112,9 @@ async def ocr_should_hide(file_id: str) -> bool:
         txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
         tl = txt.lower()
 
-        # Признаки ценника: валюта + «длинное» число + (скидка % или слово price/prezzo/retail)
+        # Признаки: валюта + «длинное» число + (скидка % или слово price/prezzo/retail)
         has_euro = ("€" in txt) or (" eur" in tl) or ("eur " in tl)
-        has_kw   = ("retail price" in tl) or ("prezzo" in tl) or (" price" in tl)
+        has_kw   = ("retail price" in tl) or ("prezzo" in tl) or (" price" in tl) or ("retail" in tl)
         has_pct  = "%" in txt
         long_num = bool(re.search(r"\b\d{3,5}\b", txt))  # 750, 1900, 12500 и т.п.
 
@@ -175,19 +175,29 @@ def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
+# -------- НОВОЕ: парсим и буквенные, и ЧИСЛОВЫЕ размеры --------
+SIZE_TOKEN = r"(?:XXS|XS|S|M|L|XL|XXL|[2-5]\d)"
+
+def parse_sizes_line(text: str) -> str:
+    """Возвращает строку, где перечислены размеры (XS… или 38, 40-44, '40( на мне), 44')."""
+    for line in text.splitlines():
+        if re.search(fr"\b{SIZE_TOKEN}\b", line, flags=re.I):
+            return line.strip()
+    return ""
+
 def parse_input(text: str) -> Dict[str, Optional[str]]:
     price_m   = re.search(r"(\d+)\s*€", text)
     discount_m= re.search(r"-(\d+)%", text)
     retail_m  = re.search(r"Retail\s*price\s*(\d+)", text, flags=re.I)
-    sizes_m   = re.search(r"((?:XS|S|M|L|XL|XXL)[^\n]*)", text, flags=re.I)
+    sizes     = parse_sizes_line(text)
     season_m  = re.search(r"(FW\d+\/\d+|SS\d+)", text)
 
     price   = float(price_m.group(1)) if price_m else None
     discount= int(discount_m.group(1)) if discount_m else 0
     retail  = float(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
-    sizes   = sizes_m.group(1).strip() if sizes_m else ""
     season  = season_m.group(1) if season_m else ""
     return {"price": price, "discount": discount, "retail": retail, "sizes": sizes, "season": season}
+# ----------------------------------------------------------------
 
 def mk_mode(label: str,
             calc: Callable[[float, int], int] = default_calc,
