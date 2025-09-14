@@ -4,6 +4,7 @@
 # Версия с 5-строчной подписью, точным парсингом размеров/сезона,
 # и двумя режимами: /lux (OCR off) и /luxocr (OCR on), одинаковая формула.
 # Округление всегда вверх; бренд из подписи удалён.
+# Альбомы БЕЗ подписи публикуются сразу (без ожидания текста).
 
 import os
 import re
@@ -52,7 +53,7 @@ def is_ocr_enabled_for(user_id: int) -> bool:
     """
     /lux      -> OCR off для альбомов
     /luxocr   -> OCR on  для альбомов
-    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALBUMS
+    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALБУMS
     """
     mode = active_mode.get(user_id, "sale")
     if mode == "lux":
@@ -357,7 +358,7 @@ MODES: Dict[str, Dict] = {
     "flash": mk_mode("FLASH"),
     "bundle": mk_mode("BUNDLE"),
     "limited": mk_mode("LIMITED"),
-    "m1": mk_mode("M1"), "m2": mk_mode("M2"), "m3": mk_mode("M3"), "m4": mk_mode("M4"), "m5": mk_mode("M5"),
+    "m1": mk_mode("M1"), "m2": mk_mode("M2"), "m3": mk_mode("М3"), "m4": mk_mode("М4"), "m5": mk_mode("М5"),
 }
 
 def is_admin(user_id: int) -> bool:
@@ -373,12 +374,21 @@ async def set_mode(msg: Message):
     active_mode[user_id] = cmd
     await msg.answer(f"✅ Режим <b>{MODES[cmd]['label']}</b> активирован.")
 
+@router.message(Command("mode"))
+async def show_mode(msg: Message):
+    user_id = msg.from_user.id
+    mode_key = active_mode.get(user_id, "sale")
+    label = MODES.get(mode_key, MODES["sale"])["label"]
+    ocr_state = "ON" if is_ocr_enabled_for(user_id) else "OFF"
+    await msg.answer(f"Текущий режим: <b>{label}</b>\nOCR в альбомах: <b>{ocr_state}</b>")
+
 @router.message(Command("help"))
 async def show_help(msg: Message):
     await msg.answer(
         "Бот принимает фото/видео (альбомы) и текст с ценой.\n"
         "• /lux — OCR выключен, /luxocr — OCR включен.\n"
-        "• Формула: ≤250€ +55€; 251–400€ +70€; >400€ → +10% и +30€. Всё округляем вверх."
+        "• Формула: ≤250€ +55€; 251–400€ +70€; >400€ → +10% и +30€. Всё округляем вверх.\n"
+        "• Альбом без подписи публикуется сразу."
     )
 
 @router.message(Command("ping"))
@@ -494,18 +504,18 @@ async def handle_album_any(msg: Message):
             items.insert(0, items.pop(idx_cap))
 
         if caption:
+            # Если есть подпись — собираем 5 строк и публикуем
             result = build_result_text(user_id, caption)
             if result:
                 await publish_to_target(user_id, items, result)
                 return
+            # если цены нет — публикуем с предупреждением
+            await publish_to_target(user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{caption}")
+            return
 
-        await _remember_media_for_text(chat_id, user_id, items, mgid=mgid, caption=caption)
-        lm = last_media.get(chat_id)
-        if not (lm and (datetime.now() - lm["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS))):
-            try:
-                await bot.send_message(chat_id, "Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую альбом одним постом.")
-            except Exception:
-                pass
+        # НЕТ подписи — публикуем альбом СРАЗУ без текста
+        await publish_to_target(user_id, items, "")
+        return
 
     buf["task"] = asyncio.create_task(_flush_album())
 
