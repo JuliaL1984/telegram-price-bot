@@ -406,6 +406,22 @@ def parse_price_discount(text: str) -> Tuple[Optional[float], Optional[int]]:
         return (None, None)
     return (price, disc)
 
+# --- NEW: парсер блока "Размеры:" ---
+SIZES_BLOCK_RE = re.compile(r"Размеры:\s*(?P<body>.+?)(?:\n\s*\n|#|$)", re.I | re.S)
+SIZE_ITEM_RE   = re.compile(r"\b(XXS|XS|S|M|L|XL|XXL|\d{2}(?:[.,]5)?)\b", re.I)
+
+def parse_sizes_block(text: str) -> str:
+    m = SIZES_BLOCK_RE.search(text or "")
+    if not m:
+        return ""
+    body = m.group("body")
+    vals = [v.upper().replace(".5", ",5") for v in SIZE_ITEM_RE.findall(body)]
+    out, seen = [], set()
+    for v in vals:
+        if v not in seen:
+            seen.add(v); out.append(v)
+    return ", ".join(out)
+
 # --- NEW: определение «ценовой» строки (для эвристик размеров) ---
 def _is_price_line(l: str) -> bool:
     return bool(re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I))
@@ -477,7 +493,8 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     discount = discount_uni if discount_uni is not None else (int(discount_m.group(1)) if discount_m else 0)
     retail   = parse_number_token(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
 
-    sizes_line  = pick_sizes_line(lines) or extract_sizes_anywhere(text)
+    # Важно: сначала пытаемся вытащить размеры из блока "Размеры:", иначе — эвристики
+    sizes_line  = parse_sizes_block(text) or pick_sizes_line(lines) or extract_sizes_anywhere(text)
     season_line = pick_season_line(lines)
 
     return {
@@ -496,7 +513,9 @@ def template_five_lines(final_price: int,
                         season_line: str,
                         brand_line: str) -> str:
     line1 = f"✅ <b>{ceil_price(final_price)}€</b>"
-    line2 = f"❌ <b>Retail price {ceil_price(retail)}€</b>"
+    # Показываем retail только если он не меньше моей цены
+    show_retail = bool(retail) and (ceil_price(final_price) <= ceil_price(retail))
+    line2 = f"❌ <b>Retail price {ceil_price(retail)}€</b>" if show_retail else ""
     line3 = sizes_line or ""
     line4 = season_line or ""
     line5 = ""
