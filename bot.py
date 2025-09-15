@@ -231,7 +231,8 @@ def _strip_seasons_for_size_scan(text: str) -> str:
     return re.sub(r"\b(?:NEW\s+)?(?:FW|SS)\d+(?:/\d+)?\b", " ", text, flags=re.I)
 
 def _strip_discounts_and_prices(text: str) -> str:
-    text = re.sub(r"-\s?\d{1,2}\s?%", " ", text)
+    # фикс: поддерживаем -, –, —, − и любые пробелы вокруг числа и процента
+    text = re.sub(r"[–—\-−]\s?\d{1,2}\s?%", " ", text)
     text = re.sub(_price_token_regex(), " ", text)
     return text
 
@@ -344,7 +345,8 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     price_m    = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
-    discount_m = re.search(r"-(\d+)%", text)
+    # фикс: поддержка пробелов и разных дефисов перед процентами
+    discount_m = re.search(r"[–—\-−]\s*(\d{1,2})\s*%", text)
     retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
 
     price    = parse_number_token(price_m.group(1)) if price_m else None
@@ -578,7 +580,7 @@ async def handle_album_any(msg: Message):
 async def handle_text(msg: Message):
     # ==== РАННИЙ ФОРВАРД ДЛЯ АКТИВНЫХ ЭМОДЗИ (без цены) ====
     txt = msg.text or ""
-    has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"-(\d+)\s?%", txt))
+    has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"[–—\-−]\s*(\d{1,2})\s?%", txt))
     has_custom = any(e.type == MessageEntityType.CUSTOM_EMOJI for e in (msg.entities or []))
     if not has_price and has_custom:
         fwd_item = [{"kind": "forward", "from_chat_id": msg.chat.id, "mid": msg.message_id, "cap": True}]
