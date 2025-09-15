@@ -379,7 +379,34 @@ def extract_sizes_anywhere(text: str) -> str:
             return ""
     return ", ".join(parts)
 
-# --- NEW: помощник, определяющий «ценовую» строку ---
+# --- NEW: универсальный парсер цены и скидки (понимает 1360-20%, 1360€ -20% и т.п.) ---
+PRICE_DISCOUNT_RE = re.compile(
+    r"""
+    (?P<price>\d{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)   # цена (допускаем 2–6 цифр, тысячи/копейки)
+    \s*(?:€|eur|euro)?\s*                               # необязательное обозначение евро
+    (?:-|—|–|\s-\s|\s—\s|\s–\s)?                        # необязательное тире/минус
+    \s*(?P<discount>\d{1,2})\s*%                        # скидка
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
+
+def parse_price_discount(text: str) -> Tuple[Optional[float], Optional[int]]:
+    if not text:
+        return (None, None)
+    m = PRICE_DISCOUNT_RE.search(text)
+    if not m:
+        return (None, None)
+    price_raw = m.group("price").replace(".", "").replace(",", ".")
+    try:
+        price = float(price_raw)
+    except ValueError:
+        return (None, None)
+    disc = int(m.group("discount"))
+    if not (0 < disc <= 90) or price <= 0:
+        return (None, None)
+    return (price, disc)
+
+# --- NEW: определение «ценовой» строки (для эвристик размеров) ---
 def _is_price_line(l: str) -> bool:
     return bool(re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I))
 
@@ -414,7 +441,6 @@ def pick_sizes_line(lines: List[str]) -> str:
             prev_is_price = (i > 0 and _is_price_line(lines[i-1].strip()))
             next_is_price = (i+1 < len(lines) and _is_price_line(lines[i+1].strip()))
             if prev_is_price or next_is_price:
-                # одиночная цифра «прилипла» к цене — считаем мусором
                 continue
             return l
 
@@ -438,12 +464,17 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     text = cleanup_text_basic(raw_text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
+    # NEW: пробуем универсальный парсер (поддерживает 1360-20%)
+    price_uni, discount_uni = parse_price_discount(text)
+
+    # Старые совместимые шаблоны (цена только с €)
     price_m    = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
     discount_m = re.search(r"[–—\-−]\s*(\d{1,2})\s*%", text)
     retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
 
-    price    = parse_number_token(price_m.group(1)) if price_m else None
-    discount = int(discount_m.group(1)) if discount_m else 0
+    # Итоговые значения
+    price    = price_uni if price_uni is not None else (parse_number_token(price_m.group(1)) if price_m else None)
+    discount = discount_uni if discount_uni is not None else (int(discount_m.group(1)) if discount_m else 0)
     retail   = parse_number_token(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
 
     sizes_line  = pick_sizes_line(lines) or extract_sizes_anywhere(text)
@@ -474,7 +505,6 @@ def template_five_lines(final_price: int,
     for s in lines:
         if not s:
             continue
-        # никаких фильтров «одиночной цифры» здесь — чтобы не терять валидные размеры
         if cleaned and s == cleaned[-1]:
             continue
         cleaned.append(s)
@@ -601,7 +631,7 @@ async def handle_single_photo(msg: Message):
             return
     await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], first_mid=msg.message_id, caption=caption)
     try:
-        await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую одним постом.")
+        await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35% или 1360-20%) — опубликую одним постом.")
     except Exception:
         pass
 
@@ -620,7 +650,7 @@ async def handle_single_video(msg: Message):
             return
     await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], first_mid=msg.message_id, caption=caption)
     try:
-        await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35%) — опубликую одним постом.")
+        await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35% или 1360-20%) — опубликую одним постом.")
     except Exception:
         pass
 
@@ -676,8 +706,10 @@ async def handle_album_any(msg: Message):
             if result:
                 await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption=result)
                 return
-            await publish_to_target(first_mid=first_mid, user_id=user_id, items=items,
-                                    caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{caption}")
+            await publish_to_target(
+                first_mid=first_mid, user_id=user_id, items=items,
+                caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35% или 1360-20%\n\n{caption}"
+            )
             return
 
         await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption="")
@@ -688,13 +720,17 @@ async def handle_album_any(msg: Message):
 @router.message(F.text)
 async def handle_text(msg: Message):
     txt = msg.text or ""
-    has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"[–—\-−]\s*(\d{1,2})\s?%", txt))
-    has_custom = any(e.type == MessageEntityType.CUSTOM_EMOJI for e in (msg.entities or []))
+    # NEW: распознаём цену без знака €
+    has_price_token = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt))
+    has_discount    = bool(re.search(r"[–—\-−]?\s*\d{1,2}\s?%", txt))
+    has_pair        = bool(PRICE_DISCOUNT_RE.search(txt))
+    has_price = has_pair or has_price_token or has_discount
 
+    has_custom = any(e.type == MessageEntityType.CUSTOM_EMOJI for e in (msg.entities or []))
     chat_id = msg.chat.id
 
     # Текст с активными эмодзи без цены — открываем НОВУЮ партию и ждём медиа
-    if not has_price and has_custom:
+    if not has_pair and not has_price_token and has_custom:
         q = _get_q(chat_id)
         rec = BatchRec(text_msg=msg, user_id=msg.from_user.id)
         q.append(rec)
@@ -717,8 +753,10 @@ async def handle_text(msg: Message):
         if result:
             await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption=result)
         else:
-            await publish_to_target(first_mid=first_mid, user_id=user_id, items=items,
-                                    caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
+            await publish_to_target(
+                first_mid=first_mid, user_id=user_id, items=items,
+                caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35% или 1360-20%\n\n{msg.text}"
+            )
 
         del last_media[chat_id]
         return
@@ -750,8 +788,10 @@ async def handle_text(msg: Message):
         if result:
             await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption=result)
         else:
-            await publish_to_target(first_mid=first_mid, user_id=user_id, items=items,
-                                    caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
+            await publish_to_target(
+                first_mid=first_mid, user_id=user_id, items=items,
+                caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35% или 1360-20%\n\n{msg.text}"
+            )
         return
 
     # Чистые тексты без цены и без custom_emoji — отправляем как текст
