@@ -220,11 +220,14 @@ def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# === РАЗМЕРЫ: EU 30–46 и US 5–12 (с половинками) ===
+# === РАЗМЕРЫ: EU 30–46, US 5–12 (с половинками) и BAL 1–6 ===
 SIZE_ALPHA   = r"(?:XXS|XS|S|M|L|XL|XXL)"
 SIZE_NUM_EU  = r"(?:3\d|4[0-6])(?:[.,]5)?"
 SIZE_NUM_US  = r"(?:[5-9]|1[0-2])(?:[.,]5)?"
-SIZE_NUM_ANY = rf"(?:{SIZE_NUM_EU}|{SIZE_NUM_US})"
+# >>> ДОБАВЛЕНО: поддержка размеров 1..6 (Balenciaga numeric)
+SIZE_NUM_BAL = r"(?:[1-6])"
+# объединяем все виды числовых размеров
+SIZE_NUM_ANY = rf"(?:{SIZE_NUM_EU}|{SIZE_NUM_US}|{SIZE_NUM_BAL})"
 SIZE_TOKEN   = rf"(?:{SIZE_ALPHA}|{SIZE_NUM_ANY})"
 
 def _strip_seasons_for_size_scan(text: str) -> str:
@@ -241,7 +244,7 @@ def extract_sizes_anywhere(text: str) -> str:
     work = _strip_seasons_for_size_scan(text)
     work = _strip_discounts_and_prices(work)
 
-    # Диапазоны: "36-41", "36/41", "6-10", "6/10"
+    # Диапазоны: "36-41", "36/41", "6-10", "6/10", "1-3" (теперь тоже)
     ranges_dash  = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})\s*[-–—]\s*({SIZE_NUM_ANY})(?!\d)", work)
     ranges_slash = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})\s*/\s*({SIZE_NUM_ANY})(?!\d)", work)
 
@@ -294,9 +297,11 @@ def extract_sizes_anywhere(text: str) -> str:
             val = only_nums[0].replace(",", ".")
             try:
                 f = float(val)
-                is_eu = 30.0 <= f <= 46.0
-                is_us = 5.0  <= f <= 12.0
-                if not (is_eu or is_us):
+                is_eu  = 30.0 <= f <= 46.0
+                is_us  = 5.0  <= f <= 12.0
+                # >>> ДОБАВЛЕНО: считаем 1..6 валидным одиночным размером
+                is_bal = 1.0  <= f <= 6.0
+                if not (is_eu or is_us or is_bal):
                     return ""
             except Exception:
                 return ""
@@ -317,7 +322,7 @@ def pick_sizes_line(lines: List[str]) -> str:
         # допускаем:
         #  - алфавитные размеры (XS…XXL)
         #  - перечни 39/40/41 или 36,5/37
-        #  - одиночный числовой размер (например, 44)
+        #  - одиночный числовой размер (например, 44 или 3)
         if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I):
             return l
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
