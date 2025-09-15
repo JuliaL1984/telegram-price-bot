@@ -379,15 +379,67 @@ def extract_sizes_anywhere(text: str) -> str:
             return ""
     return ", ".join(parts)
 
+# --- УНИВЕРСАЛЬНЫЙ ПАРСЕР ДЕНЕГ (495.00, 495,00, 2.950, 2,950 и т.п.) ---
+def parse_money_token(token: Optional[str]) -> Optional[float]:
+    if not token:
+        return None
+    s = re.sub(r"[^\d.,]", "", token)
+    if not s:
+        return None
+    # оба разделителя присутствуют
+    if "," in s and "." in s:
+        # Десятичный — тот, что справа
+        if s.rfind(",") > s.rfind("."):
+            dec, thou = ",", "."
+        else:
+            dec, thou = ".", ","
+        s = s.replace(thou, "").replace(dec, ".")
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    # только запятые
+    if "," in s and "." not in s:
+        # одиночная запятая и 1–2 цифры справа трактуем как десятичную
+        if s.count(",") == 1 and re.search(r",\d{1,2}$", s):
+            s = s.replace(",", ".")
+            try:
+                return float(s)
+            except ValueError:
+                return None
+        # иначе считаем разделителем тысяч
+        s = s.replace(",", "")
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    # только точки
+    if "." in s and "," not in s:
+        if s.count(".") == 1 and re.search(r"\.\d{1,2}$", s):
+            try:
+                return float(s)
+            except ValueError:
+                return None
+        s = s.replace(".", "")
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    # только цифры
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
 # --- NEW: универсальный парсер цены и скидки (понимает 1360-20%, 1360€ -20% и т.п.) ---
 PRICE_DISCOUNT_RE = re.compile(
     r"""
-    (?P<price>\d{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)   # цена (допускаем 2–6 цифр, тысячи/копейки)
+    (?P<price>\d{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)   # цена (тысячи/копейки)
     \s*(?:€|eur|euro)?\s*                               # необязательное обозначение евро
     (?:-|—|–|\s-\s|\s—\s|\s–\s)?                        # необязательное тире/минус
     \s*(?P<discount>\d{1,2})\s*%                        # скидка
     """,
-    re.IGNORECASE | re.VERBOSE
+    re.IGNORECASE | re.VERBOSE | re.S
 )
 
 def parse_price_discount(text: str) -> Tuple[Optional[float], Optional[int]]:
@@ -396,10 +448,8 @@ def parse_price_discount(text: str) -> Tuple[Optional[float], Optional[int]]:
     m = PRICE_DISCOUNT_RE.search(text)
     if not m:
         return (None, None)
-    price_raw = m.group("price").replace(".", "").replace(",", ".")
-    try:
-        price = float(price_raw)
-    except ValueError:
+    price = parse_money_token(m.group("price"))
+    if price is None:
         return (None, None)
     disc = int(m.group("discount"))
     if not (0 < disc <= 90) or price <= 0:
@@ -472,9 +522,7 @@ def pick_season_line(lines: List[str]) -> str:
     return ""
 
 def parse_number_token(token: Optional[str]) -> Optional[float]:
-    if not token:
-        return None
-    return float(token.replace('.', '').replace(',', ''))
+    return parse_money_token(token)
 
 def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     text = cleanup_text_basic(raw_text)
@@ -484,9 +532,10 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     price_uni, discount_uni = parse_price_discount(text)
 
     # Старые совместимые шаблоны (цена только с €)
-    price_m    = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
+    price_m    = re.search(r"(\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*€", text)
     discount_m = re.search(r"[–—\-−]\s*(\d{1,2})\s*%", text)
-    retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
+    # Позволяем в retail как тысячи, так и десятичные копейки
+    retail_m   = re.search(r"Retail\s*price\s*(\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)", text, flags=re.I)
 
     # Итоговые значения
     price    = price_uni if price_uni is not None else (parse_number_token(price_m.group(1)) if price_m else None)
