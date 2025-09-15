@@ -29,6 +29,9 @@ ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "1500"))  # стабильнее собирает альбомы
 ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 
+# <<< НОВОЕ: сколько держать текст с эмодзи в ожидании фото >>>
+BATCH_IDLE_MS = int(os.getenv("BATCH_IDLE_MS", "2200"))
+
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
 
@@ -47,6 +50,10 @@ dp.include_router(router)
 last_media: Dict[int, Dict[str, Any]] = {}
 active_mode: Dict[int, str] = {}
 album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
+
+# <<< НОВОЕ: отложенные тексты с активными эмодзи, которые ждут свои фото >>>
+# pending_text[chat_id] = {"msg": Message, "timer": asyncio.Task}
+pending_text: Dict[int, Dict[str, Any]] = {}
 
 # ====== ГЛОБАЛЬНЫЙ ПОРЯДОК ПО message_id (min-heap) ======
 # payload: (seq, first_mid, user_id, items, caption, album_ocr_on)
@@ -270,15 +277,17 @@ def extract_sizes_anywhere(text: str) -> str:
     def _expand(n1: str, n2: str):
         try:
             a = float(n1.replace(",", "."))
-            b = float(n2.replace(",", "."))
-            lo, hi = sorted((a, b))
-            x = lo
-            while x <= hi + 1e-9:
-                s = ("{:.1f}".format(x)).replace(".5", ",5").rstrip("0").rstrip(",")
-                covered_nums.add(s)
-                x += 0.5
+            b = float(n2).replace(",", ".")  # type: ignore
         except Exception:
-            pass
+            a = float(n1.replace(",", "."))
+            b = float(n2.replace(",", "."))
+        lo, hi = sorted((a, b))
+        x = lo
+        while x <= hi + 1e-9:
+            s = ("{:.1f}".format(x)).replace(".5", ",5").rstrip("0").rstrip(",")
+            covered_nums.add(s)
+            x += 0.5
+
     for a, b in (ranges_dash + ranges_slash):
         _expand(a, b)
 
@@ -319,10 +328,7 @@ def pick_sizes_line(lines: List[str]) -> str:
             continue
         if re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I):
             continue
-        # допускаем:
-        #  - алфавитные размеры (XS…XXL)
-        #  - перечни 39/40/41 или 36,5/37
-        #  - одиночный числовой размер (например, 44 или 3)
+        # допускаем: алфавитные, перечни 39/40/41, одиночный числовой
         if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I):
             return l
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
@@ -410,7 +416,6 @@ MODES: Dict[str, Dict] = {
     "bags20": mk_mode("BAGS -20%"),
     "bags25": mk_mode("BAGS -25%"),
     "bags30": mk_mode("BAGS -30%"),
-    "bags40": mk_mode("BAGS -40%"),
     "shoes10": mk_mode("SHOES -10%"),
     "shoes20": mk_mode("SHOES -20%"),
     "shoes30": mk_mode("SHOES -30%"),
@@ -484,7 +489,7 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
         brand_line="",
     )
 
-# ====== ХЕЛПЕР ======
+# ====== ХЕЛПЕРЫ ======
 async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[str, Any]], first_mid: int, caption: str = ""):
     last_media[chat_id] = {
         "ts": datetime.now(),
@@ -494,11 +499,54 @@ async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[
         "first_mid": first_mid,
     }
 
+def _cancel_pending_text(chat_id: int) -> Optional[Message]:
+    """Отменяет таймер и возвращает сохранённый текст, если был."""
+    rec = pending_text.pop(chat_id, None)
+    if not rec:
+        return None
+    t = rec.get("timer")
+    if t:
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    return rec.get("msg")
+
+async def _publish_text_then_media(text_msg: Message, media_items: List[Dict[str, Any]], media_first_mid: int, user_id: int):
+    """
+    Публикуем пакет: (1) текст форвардом, (2) фото/альбом.
+    Оба сообщения получают один и тот же seq = message_id текста, чтобы быть рядом.
+    """
+    if not text_msg:
+        return
+    text_first = text_msg.message_id
+    # 1) текст
+    await publish_to_target(
+        first_mid=text_first,
+        user_id=user_id,
+        items=[{"kind": "forward", "from_chat_id": text_msg.chat.id, "mid": text_msg.message_id, "cap": True}],
+        caption=""
+    )
+    # 2) медиа (с пустой подписью — она тебе и нужна)
+    await publish_to_target(
+        first_mid=text_first,  # важный момент: тот же seq, что у текста
+        user_id=user_id,
+        items=media_items,
+        caption=""
+    )
+
 # ====== ХЕНДЛЕРЫ ======
 @router.message(F.photo & (F.media_group_id == None))
 async def handle_single_photo(msg: Message):
     item = {"kind": "photo", "fid": msg.photo[-1].file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
+
+    # Если есть отложенный текст-эмодзи — публикуем пакет (текст -> фото)
+    pend = _cancel_pending_text(msg.chat.id)
+    if pend:
+        await _publish_text_then_media(pend, [item], msg.message_id, msg.from_user.id)
+        return
+
     if caption:
         result = build_result_text(msg.from_user.id, caption)
         if result:
@@ -514,6 +562,12 @@ async def handle_single_photo(msg: Message):
 async def handle_single_video(msg: Message):
     item = {"kind": "video", "fid": msg.video.file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
+
+    pend = _cancel_pending_text(msg.chat.id)
+    if pend:
+        await _publish_text_then_media(pend, [item], msg.message_id, msg.from_user.id)
+        return
+
     if caption:
         result = build_result_text(msg.from_user.id, caption)
         if result:
@@ -567,6 +621,13 @@ async def handle_album_any(msg: Message):
 
         items.sort(key=lambda x: x["mid"])
 
+        # Если ждёт отложенный текст-эмодзи и у альбома НЕТ ценовой подписи — публикуем пакетом
+        pend = pending_text.get(chat_id, {}).get("msg")
+        if pend and not caption:
+            _cancel_pending_text(chat_id)
+            await _publish_text_then_media(pend, items, first_mid, user_id)
+            return
+
         if caption:
             result = build_result_text(user_id, caption)
             if result:
@@ -583,19 +644,47 @@ async def handle_album_any(msg: Message):
 
 @router.message(F.text)
 async def handle_text(msg: Message):
-    # ==== РАННИЙ ФОРВАРД ДЛЯ АКТИВНЫХ ЭМОДЗИ (без цены) ====
     txt = msg.text or ""
     has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"[–—\-−]\s*(\d{1,2})\s?%", txt))
     has_custom = any(e.type == MessageEntityType.CUSTOM_EMOJI for e in (msg.entities or []))
-    if not has_price and has_custom:
-        fwd_item = [{"kind": "forward", "from_chat_id": msg.chat.id, "mid": msg.message_id, "cap": True}]
-        await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=fwd_item, caption="")
-        return
-    # ======================================================
 
     chat_id = msg.chat.id
-    bucket = last_media.get(chat_id)
 
+    # <<< НОВОЕ: если это "сообщение с эмодзи" БЕЗ цены — ставим в ожидание фото >>>
+    if not has_price and has_custom:
+        # если уже что-то ждёт — публикуем старое, и ставим новое
+        old = _cancel_pending_text(chat_id)
+        if old:
+            # старое не дождалось медиа — публикуем его отдельным постом
+            await publish_to_target(
+                first_mid=old.message_id,
+                user_id=old.from_user.id if old.from_user else msg.from_user.id,
+                items=[{"kind": "forward", "from_chat_id": old.chat.id, "mid": old.message_id, "cap": True}],
+                caption=""
+            )
+
+        async def _timer_fire():
+            try:
+                await asyncio.sleep(BATCH_IDLE_MS / 1000)
+            except asyncio.CancelledError:
+                return
+            rec = pending_text.pop(chat_id, None)
+            if rec:
+                tmsg: Message = rec["msg"]
+                await publish_to_target(
+                    first_mid=tmsg.message_id,
+                    user_id=tmsg.from_user.id if tmsg.from_user else msg.from_user.id,
+                    items=[{"kind": "forward", "from_chat_id": tmsg.chat.id, "mid": tmsg.message_id, "cap": True}],
+                    caption=""
+                )
+
+        t = asyncio.create_task(_timer_fire())
+        pending_text[chat_id] = {"msg": msg, "timer": t}
+        return
+    # ==========================================================================
+
+    # Привязка к одиночным медиа, отправленным ранее (окно ALBUM_WINDOW_SECONDS)
+    bucket = last_media.get(chat_id)
     if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
         user_id = bucket.get("user_id") or msg.from_user.id
         raw_text = (bucket.get("caption") or "")
