@@ -14,6 +14,8 @@ import asyncio
 import heapq
 from typing import Dict, Callable, Optional, List, Tuple, Any
 from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from collections import deque
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, InputMediaPhoto, InputMediaVideo
@@ -29,14 +31,13 @@ ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "1500"))  # стабильнее собирает альбомы
 ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 
-# <<< НОВОЕ: сколько держать текст с эмодзи в ожидании фото >>>
-BATCH_IDLE_MS = int(os.getenv("BATCH_IDLE_MS", "2200"))
+# Сколько держать текст с эмодзи в ожидании фото (очереди партий)
+BATCH_IDLE_MS = int(os.getenv("BATCH_IDLE_MS", "2800"))
 
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
 
 # Базовая политика: в альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
-# ВАЖНО: только латиница в названии env переменной
 FILTER_PRICETAGS_IN_ALBUMS = os.getenv("FILTER_PRICETAGS_IN_ALBUMS", "1") == "1"
 
 # ====== ИНИЦИАЛИЗАЦИЯ ======
@@ -51,9 +52,78 @@ last_media: Dict[int, Dict[str, Any]] = {}
 active_mode: Dict[int, str] = {}
 album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
-# <<< НОВОЕ: отложенные тексты с активными эмодзи, которые ждут свои фото >>>
-# pending_text[chat_id] = {"msg": Message, "timer": asyncio.Task}
-pending_text: Dict[int, Dict[str, Any]] = {}
+# -------- Очередь партий (FIFO) для текстов-эмодзи и их медиа --------
+@dataclass
+class BatchRec:
+    text_msg: Optional[Message] = None
+    media: List[Dict[str, Any]] = field(default_factory=list)
+    timer: Optional[asyncio.Task] = None
+    user_id: Optional[int] = None
+
+batches: Dict[int, deque[BatchRec]] = {}
+
+def _get_q(chat_id: int) -> deque:
+    q = batches.get(chat_id)
+    if q is None:
+        q = batches[chat_id] = deque()
+    return q
+
+def _arm_batch_timer(chat_id: int, rec: BatchRec):
+    # Если медиа не придут вовремя — публикуем один текст (форвардом)
+    if rec.timer:
+        rec.timer.cancel()
+    async def _fire():
+        try:
+            await asyncio.sleep(BATCH_IDLE_MS/1000)
+        except asyncio.CancelledError:
+            return
+        q = _get_q(chat_id)
+        if rec in q and not rec.media and rec.text_msg:
+            q.remove(rec)
+            await publish_to_target(
+                first_mid=rec.text_msg.message_id,
+                user_id=rec.user_id or (rec.text_msg.from_user.id if rec.text_msg.from_user else 0),
+                items=[{"kind": "forward", "from_chat_id": rec.text_msg.chat.id, "mid": rec.text_msg.message_id, "cap": True}],
+                caption=""
+            )
+    rec.timer = asyncio.create_task(_fire())
+
+async def _publish_batch_pair(chat_id: int, rec: BatchRec):
+    # Публикуем: ТЕКСТ → МЕДИА с одинаковым seq (message_id текста)
+    if rec.timer:
+        rec.timer.cancel()
+    text_first = rec.text_msg.message_id if rec.text_msg else (rec.media[0]["mid"] if rec.media else 0)
+    user_id = rec.user_id or (rec.text_msg.from_user.id if rec.text_msg and rec.text_msg.from_user else 0)
+    if rec.text_msg:
+        await publish_to_target(
+            first_mid=text_first,
+            user_id=user_id,
+            items=[{"kind": "forward", "from_chat_id": rec.text_msg.chat.id, "mid": rec.text_msg.message_id, "cap": True}],
+            caption=""
+        )
+    if rec.media:
+        await publish_to_target(
+            first_mid=text_first,
+            user_id=user_id,
+            items=rec.media,
+            caption=""
+        )
+
+def _attach_media_to_next_batch(chat_id: int, media_items: List[Dict[str, Any]], user_id: int) -> bool:
+    """
+    Находит самую раннюю партию без медиа, прикрепляет к ней и публикует парой.
+    Возвращает True, если медиа использованы; иначе False.
+    """
+    q = _get_q(chat_id)
+    for rec in list(q):
+        if rec.media:
+            continue
+        rec.media = media_items
+        rec.user_id = rec.user_id or user_id
+        asyncio.create_task(_publish_batch_pair(chat_id, rec))
+        q.remove(rec)
+        return True
+    return False
 
 # ====== ГЛОБАЛЬНЫЙ ПОРЯДОК ПО message_id (min-heap) ======
 # payload: (seq, first_mid, user_id, items, caption, album_ocr_on)
@@ -62,15 +132,9 @@ _heap: List[Tuple[int, int, Tuple[int, int, int, List[Dict[str, Any]], str, bool
 _heap_tie = 0  # чтобы различать одинаковые seq (на всякий случай)
 
 def calc_seq_by_first_mid(first_mid: int) -> int:
-    # Используем message_id самого раннего сообщения как глобальный порядок.
     return int(first_mid)
 
 def is_ocr_enabled_for(user_id: int) -> bool:
-    """
-    /lux      -> OCR off для альбомов
-    /luxocr   -> OCR on  для альбомов
-    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALBUMS
-    """
     mode = active_mode.get(user_id, "sale")
     if mode == "lux":
         return False
@@ -156,8 +220,8 @@ if OCR_ENABLED:
         OCR_ENABLED = False
 
 def _price_token_regex() -> str:
-    # "€123", "€ 2.950", "2,950 €", "2950€"
-    return r"(?:€\s*\d{2,3}(?:[.,]\d{3})*|\d{2,3}(?:[.,]\d{3})*\s*€)"
+    # Более широкая поддержка: "€123", "€ 2.950", "2,950 €", "2950€", "2400€"
+    return r"(?:€\s*\d{1,6}(?:[.,]\d{3})*|\d{1,6}(?:[.,]\d{3})*\s*€)"
 
 async def ocr_should_hide(file_id: str) -> bool:
     """Прятать ли фото-ценник (видео не трогаем)."""
@@ -231,9 +295,7 @@ def cleanup_text_basic(text: str) -> str:
 SIZE_ALPHA   = r"(?:XXS|XS|S|M|L|XL|XXL)"
 SIZE_NUM_EU  = r"(?:3\d|4[0-6])(?:[.,]5)?"
 SIZE_NUM_US  = r"(?:[5-9]|1[0-2])(?:[.,]5)?"
-# >>> ДОБАВЛЕНО: поддержка размеров 1..6 (Balenciaga numeric)
 SIZE_NUM_BAL = r"(?:[1-6])"
-# объединяем все виды числовых размеров
 SIZE_NUM_ANY = rf"(?:{SIZE_NUM_EU}|{SIZE_NUM_US}|{SIZE_NUM_BAL})"
 SIZE_TOKEN   = rf"(?:{SIZE_ALPHA}|{SIZE_NUM_ANY})"
 
@@ -241,7 +303,7 @@ def _strip_seasons_for_size_scan(text: str) -> str:
     return re.sub(r"\b(?:NEW\s+)?(?:FW|SS)\d+(?:/\d+)?\b", " ", text, flags=re.I)
 
 def _strip_discounts_and_prices(text: str) -> str:
-    # фикс: поддерживаем -, –, —, − и любые пробелы вокруг числа и процента
+    # поддерживаем -, –, —, − и удаляем ценники любой длины
     text = re.sub(r"[–—\-−]\s?\d{1,2}\s?%", " ", text)
     text = re.sub(_price_token_regex(), " ", text)
     return text
@@ -251,7 +313,7 @@ def extract_sizes_anywhere(text: str) -> str:
     work = _strip_seasons_for_size_scan(text)
     work = _strip_discounts_and_prices(work)
 
-    # Диапазоны: "36-41", "36/41", "6-10", "6/10", "1-3" (теперь тоже)
+    # Диапазоны: "36-41", "36/41", "6-10", "6/10", "1-3"
     ranges_dash  = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})\s*[-–—]\s*({SIZE_NUM_ANY})(?!\d)", work)
     ranges_slash = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})\s*/\s*({SIZE_NUM_ANY})(?!\d)", work)
 
@@ -308,7 +370,6 @@ def extract_sizes_anywhere(text: str) -> str:
                 f = float(val)
                 is_eu  = 30.0 <= f <= 46.0
                 is_us  = 5.0  <= f <= 12.0
-                # >>> ДОБАВЛЕНО: считаем 1..6 валидным одиночным размером
                 is_bal = 1.0  <= f <= 6.0
                 if not (is_eu or is_us or is_bal):
                     return ""
@@ -316,8 +377,6 @@ def extract_sizes_anywhere(text: str) -> str:
                 return ""
         elif len(only_nums) == 0:
             return ""
-    # ----------------------------------------------------------
-
     return ", ".join(parts)
 
 def pick_sizes_line(lines: List[str]) -> str:
@@ -328,7 +387,6 @@ def pick_sizes_line(lines: List[str]) -> str:
             continue
         if re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I):
             continue
-        # допускаем: алфавитные, перечни 39/40/41, одиночный числовой
         if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I):
             return l
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
@@ -356,7 +414,6 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     price_m    = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
-    # фикс: поддержка пробелов и разных дефисов перед процентами
     discount_m = re.search(r"[–—\-−]\s*(\d{1,2})\s*%", text)
     retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
 
@@ -390,7 +447,12 @@ def template_five_lines(final_price: int,
     lines = [line1, line2, line3, line4, line5]
     cleaned = []
     for s in lines:
-        if cleaned and s and s == cleaned[-1]:
+        if not s:
+            continue
+        # защита от случайных числовых артефактов
+        if re.fullmatch(r"\d{1,2}$", s.strip()):
+            continue
+        if cleaned and s == cleaned[-1]:
             continue
         cleaned.append(s)
     while len(cleaned) < 5:
@@ -499,52 +561,14 @@ async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[
         "first_mid": first_mid,
     }
 
-def _cancel_pending_text(chat_id: int) -> Optional[Message]:
-    """Отменяет таймер и возвращает сохранённый текст, если был."""
-    rec = pending_text.pop(chat_id, None)
-    if not rec:
-        return None
-    t = rec.get("timer")
-    if t:
-        try:
-            t.cancel()
-        except Exception:
-            pass
-    return rec.get("msg")
-
-async def _publish_text_then_media(text_msg: Message, media_items: List[Dict[str, Any]], media_first_mid: int, user_id: int):
-    """
-    Публикуем пакет: (1) текст форвардом, (2) фото/альбом.
-    Оба сообщения получают один и тот же seq = message_id текста, чтобы быть рядом.
-    """
-    if not text_msg:
-        return
-    text_first = text_msg.message_id
-    # 1) текст
-    await publish_to_target(
-        first_mid=text_first,
-        user_id=user_id,
-        items=[{"kind": "forward", "from_chat_id": text_msg.chat.id, "mid": text_msg.message_id, "cap": True}],
-        caption=""
-    )
-    # 2) медиа (с пустой подписью — она тебе и нужна)
-    await publish_to_target(
-        first_mid=text_first,  # важный момент: тот же seq, что у текста
-        user_id=user_id,
-        items=media_items,
-        caption=""
-    )
-
 # ====== ХЕНДЛЕРЫ ======
 @router.message(F.photo & (F.media_group_id == None))
 async def handle_single_photo(msg: Message):
     item = {"kind": "photo", "fid": msg.photo[-1].file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
 
-    # Если есть отложенный текст-эмодзи — публикуем пакет (текст -> фото)
-    pend = _cancel_pending_text(msg.chat.id)
-    if pend:
-        await _publish_text_then_media(pend, [item], msg.message_id, msg.from_user.id)
+    # Если есть ожидающая партия — прикрепляем и публикуем как пара
+    if _attach_media_to_next_batch(msg.chat.id, [item], msg.from_user.id):
         return
 
     if caption:
@@ -563,9 +587,7 @@ async def handle_single_video(msg: Message):
     item = {"kind": "video", "fid": msg.video.file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
 
-    pend = _cancel_pending_text(msg.chat.id)
-    if pend:
-        await _publish_text_then_media(pend, [item], msg.message_id, msg.from_user.id)
+    if _attach_media_to_next_batch(msg.chat.id, [item], msg.from_user.id):
         return
 
     if caption:
@@ -621,12 +643,10 @@ async def handle_album_any(msg: Message):
 
         items.sort(key=lambda x: x["mid"])
 
-        # Если ждёт отложенный текст-эмодзи и у альбома НЕТ ценовой подписи — публикуем пакетом
-        pend = pending_text.get(chat_id, {}).get("msg")
-        if pend and not caption:
-            _cancel_pending_text(chat_id)
-            await _publish_text_then_media(pend, items, first_mid, user_id)
-            return
+        # Если есть ожидающая партия и у альбома нет ценовой подписи — прикрепляем к партии
+        if not caption:
+            if _attach_media_to_next_batch(chat_id, items, user_id):
+                return
 
         if caption:
             result = build_result_text(user_id, caption)
@@ -650,38 +670,13 @@ async def handle_text(msg: Message):
 
     chat_id = msg.chat.id
 
-    # <<< НОВОЕ: если это "сообщение с эмодзи" БЕЗ цены — ставим в ожидание фото >>>
+    # Текст с активными эмодзи без цены — открываем НОВУЮ партию и ждём медиа
     if not has_price and has_custom:
-        # если уже что-то ждёт — публикуем старое, и ставим новое
-        old = _cancel_pending_text(chat_id)
-        if old:
-            # старое не дождалось медиа — публикуем его отдельным постом
-            await publish_to_target(
-                first_mid=old.message_id,
-                user_id=old.from_user.id if old.from_user else msg.from_user.id,
-                items=[{"kind": "forward", "from_chat_id": old.chat.id, "mid": old.message_id, "cap": True}],
-                caption=""
-            )
-
-        async def _timer_fire():
-            try:
-                await asyncio.sleep(BATCH_IDLE_MS / 1000)
-            except asyncio.CancelledError:
-                return
-            rec = pending_text.pop(chat_id, None)
-            if rec:
-                tmsg: Message = rec["msg"]
-                await publish_to_target(
-                    first_mid=tmsg.message_id,
-                    user_id=tmsg.from_user.id if tmsg.from_user else msg.from_user.id,
-                    items=[{"kind": "forward", "from_chat_id": tmsg.chat.id, "mid": tmsg.message_id, "cap": True}],
-                    caption=""
-                )
-
-        t = asyncio.create_task(_timer_fire())
-        pending_text[chat_id] = {"msg": msg, "timer": t}
+        q = _get_q(chat_id)
+        rec = BatchRec(text_msg=msg, user_id=msg.from_user.id)
+        q.append(rec)
+        _arm_batch_timer(chat_id, rec)
         return
-    # ==========================================================================
 
     # Привязка к одиночным медиа, отправленным ранее (окно ALBUM_WINDOW_SECONDS)
     bucket = last_media.get(chat_id)
