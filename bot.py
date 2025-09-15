@@ -379,20 +379,45 @@ def extract_sizes_anywhere(text: str) -> str:
             return ""
     return ", ".join(parts)
 
+# --- NEW: помощник, определяющий «ценовую» строку ---
+def _is_price_line(l: str) -> bool:
+    return bool(re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I))
+
 def pick_sizes_line(lines: List[str]) -> str:
-    """Предпочтительно берём отдельную строку с размерами без €/%/retail/price."""
+    """
+    Выбираем лучшую строку с размерами.
+    Приоритет 1: алфавитные размеры или перечисления/диапазоны.
+    Приоритет 2: одиночный числовой размер, НО не вплотную к строке с ценой.
+    """
+
+    # --- Pass 1: «сильные» кандидаты ---
     for line in lines:
         l = line.strip()
-        if not l:
+        if not l or _is_price_line(l):
             continue
-        if re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I):
-            continue
+        # XS…XXL
         if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I):
             return l
+        # перечисления 39/40/41, 36,5/37, 1,2,3
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
             return l
-        if re.fullmatch(rf"{SIZE_NUM_ANY}", l):
+        # диапазоны 36-41, 6–10, 1-3
+        if re.search(rf"(?<!\d){SIZE_NUM_ANY}\s*[-–/]\s*{SIZE_NUM_ANY}(?!\d)", l):
             return l
+
+    # --- Pass 2: одиночный размер, но не рядом с ценой ---
+    for i, line in enumerate(lines):
+        l = line.strip()
+        if not l or _is_price_line(l):
+            continue
+        if re.fullmatch(rf"{SIZE_NUM_ANY}", l):
+            prev_is_price = (i > 0 and _is_price_line(lines[i-1].strip()))
+            next_is_price = (i+1 < len(lines) and _is_price_line(lines[i+1].strip()))
+            if prev_is_price or next_is_price:
+                # одиночная цифра «прилипла» к цене — считаем мусором
+                continue
+            return l
+
     return ""
 
 def pick_season_line(lines: List[str]) -> str:
@@ -449,9 +474,7 @@ def template_five_lines(final_price: int,
     for s in lines:
         if not s:
             continue
-        # защита от случайных числовых артефактов
-        if re.fullmatch(r"\d{1,2}$", s.strip()):
-            continue
+        # никаких фильтров «одиночной цифры» здесь — чтобы не терять валидные размеры
         if cleaned and s == cleaned[-1]:
             continue
         cleaned.append(s)
