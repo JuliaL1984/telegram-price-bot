@@ -10,6 +10,7 @@ import os
 import re
 import io
 import math
+import json
 import asyncio
 import heapq
 from typing import Dict, Callable, Optional, List, Tuple, Any
@@ -34,8 +35,10 @@ ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 # Сколько держать текст с эмодзи в ожидании фото (очереди партий)
 BATCH_IDLE_MS = int(os.getenv("BATCH_IDLE_MS", "2800"))
 
+# OCR
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
+VISION_JSON = os.getenv("VISION_JSON", "").strip()  # если есть — используем Google Vision
 
 # Базовая политика: в альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
 FILTER_PRICETAGS_IN_ALBUMS = os.getenv("FILTER_PRICETAGS_IN_ALBUMS", "1") == "1"
@@ -203,8 +206,8 @@ async def publish_worker():
             _seq, first_mid, user_id, items, caption, album_ocr_on = pl
             try:
                 await _do_publish(user_id, items, caption, album_ocr_on)
-            except Exception:
-                pass
+            except Exception as e:
+                print("PUBLISH ERROR:", repr(e))
 
 async def publish_to_target(first_mid: int, user_id: int, items: List[Dict[str, Any]], caption: str):
     album_ocr_on = is_ocr_enabled_for(user_id)
@@ -212,35 +215,142 @@ async def publish_to_target(first_mid: int, user_id: int, items: List[Dict[str, 
     await publish_queue.put((seq, first_mid, user_id, items, caption, album_ocr_on))
 
 # ====== OCR ======
+# Инициализация Google Vision (если есть VISION_JSON)
+GV_CLIENT = None
+if OCR_ENABLED and VISION_JSON:
+    try:
+        from google.cloud import vision as gv
+        # Разрешаем как JSON-текст, так и JSON-файл (путь)
+        creds_dict = None
+        if VISION_JSON.startswith("{"):
+            creds_dict = json.loads(VISION_JSON)
+            import google.oauth2.service_account as svc
+            creds = svc.Credentials.from_service_account_info(creds_dict)
+            GV_CLIENT = gv.ImageAnnotatorClient(credentials=creds)
+        else:
+            # предполагаем путь к файлу
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = VISION_JSON
+            GV_CLIENT = gv.ImageAnnotatorClient()
+        print("Google Vision: initialized")
+    except Exception as e:
+        GV_CLIENT = None
+        print("Google Vision init failed:", repr(e))
+
+# Инициализация Tesseract
+TESS_AVAILABLE = False
 if OCR_ENABLED:
     try:
-        import pytesseract
-        from PIL import Image
-    except Exception:
-        OCR_ENABLED = False
+        import pytesseract  # noqa
+        from PIL import Image, ImageOps, ImageFilter  # noqa
+        TESS_AVAILABLE = True
+        print("Tesseract: available")
+    except Exception as e:
+        print("Tesseract not available:", repr(e))
 
-def _price_token_regex() -> str:
-    # Более широкая поддержка: "€123", "€ 2.950", "2,950 €", "2950€", "2400€"
-    return r"(?:€\s*\d{1,6}(?:[.,]\d{3})*|\d{1,6}(?:[.,]\d{3})*\s*€)"
+_PRICE_TOKEN_RE = re.compile(
+    r"""(?xi)
+    (?:                # слева символ €
+        [€]\s*\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?
+     |                 # или справа символ €
+        \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*[€]
+     |                 # или EUR/euro
+        \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:eur|euro)
+    )
+    """
+)
+
+# дополнительно ловим «1360 -20%» или «1360€-35%»
+_PRICE_WITH_DISC_RE = re.compile(
+    r"""(?xi)
+    \d{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:€|eur|euro)?
+    \s*(?:-|—|–)?\s*\d{1,2}\s*%
+    """
+)
+
+def _preprocess_for_tesseract(img):
+    # ч/б, повышение контраста/резкости — помогает для жёлтых ценников
+    from PIL import ImageOps, ImageFilter
+    g = ImageOps.grayscale(img)
+    g = ImageOps.autocontrast(g)
+    g = g.filter(ImageFilter.SHARPEN)
+    return g
+
+async def _load_bytes(file_id: str) -> bytes:
+    file = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await bot.download(file, buf)
+    return buf.getvalue()
+
+def _ocr_google_vision(data: bytes) -> str:
+    if not GV_CLIENT:
+        return ""
+    try:
+        from google.cloud import vision as gv  # type: ignore
+        image = gv.Image(content=data)
+        resp = GV_CLIENT.document_text_detection(image=image)
+        if resp.error.message:
+            print("GV ERROR:", resp.error.message)
+            return ""
+        return (resp.full_text_annotation.text or "").strip()
+    except Exception as e:
+        print("GV EXC:", repr(e))
+        return ""
+
+def _ocr_tesseract(data: bytes) -> str:
+    if not TESS_AVAILABLE:
+        return ""
+    try:
+        from PIL import Image
+        import pytesseract
+        img = Image.open(io.BytesIO(data))
+        img = _preprocess_for_tesseract(img)
+        cfg = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
+        text = pytesseract.image_to_string(img, lang=OCR_LANG, config=cfg)
+        return (text or "").strip()
+    except Exception as e:
+        print("TESS EXC:", repr(e))
+        return ""
+
+def _ocr_extract_text(data: bytes) -> Tuple[str, str]:
+    """
+    Возвращает (engine, text), где engine ∈ {"GV","TESS",""}.
+    Сначала пробуем Google Vision, потом Tesseract.
+    """
+    if GV_CLIENT:
+        t = _ocr_google_vision(data)
+        if t:
+            return ("GV", t)
+    if TESS_AVAILABLE:
+        t = _ocr_tesseract(data)
+        if t:
+            return ("TESS", t)
+    return ("", "")
+
+def _looks_like_price_text(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    has_kw = any(k in low for k in ("retail", "prezzo", "price", "eur", "%"))
+    has_token = bool(_PRICE_TOKEN_RE.search(text)) or bool(_PRICE_WITH_DISC_RE.search(text))
+    # Делаем фильтр мягче: если есть явный «€»/«eur» И есть число — тоже ок
+    has_basic = ("€" in text or "eur" in low or "euro" in low) and bool(re.search(r"\d", text))
+    return has_token or (has_kw and bool(re.search(r"\d", text))) or has_basic
 
 async def ocr_should_hide(file_id: str) -> bool:
     """Прятать ли фото-ценник (видео не трогаем)."""
     if not OCR_ENABLED:
         return False
     try:
-        file = await bot.get_file(file_id)
-        buf = io.BytesIO()
-        await bot.download(file, buf)
-        buf.seek(0)
-        from PIL import Image
-        import pytesseract
-        img = Image.open(buf)
-        txt = pytesseract.image_to_string(img, lang=OCR_LANG) or ""
-        tl = txt.lower()
-        has_price_token = bool(re.search(_price_token_regex(), txt))
-        has_kw = ("retail" in tl) or ("price" in tl) or ("prezzo" in tl) or ("%" in txt)
-        return bool(has_price_token and has_kw)
-    except Exception:
+        data = await _load_bytes(file_id)
+        engine, txt = _ocr_extract_text(data)
+        if not txt:
+            print(f"OCR[{engine or 'NONE'}] NOT_FOUND")
+            return False
+        found = _looks_like_price_text(txt)
+        print(f"OCR[{engine}] {'FOUND' if found else 'NOT_FOUND'} :: {txt[:120].replace(chr(10),' ')}")
+        return found
+    except Exception as e:
+        print("OCR ERROR:", repr(e))
         return False
 
 async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool) -> List[Dict[str, Any]]:
@@ -255,10 +365,13 @@ async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool)
     kept: List[Dict[str, Any]] = []
     for it in items:
         if it["kind"] == "photo":
-            if not await ocr_should_hide(it["fid"]):
+            hide = await ocr_should_hide(it["fid"])
+            if not hide:
                 kept.append(it)
         else:
             kept.append(it)
+
+    # Гарантируем, что альбом не пустой
     return kept if kept else items[:1]
 
 # ====== КАЛЬКУЛЯТОРЫ ======
@@ -305,7 +418,7 @@ def _strip_seasons_for_size_scan(text: str) -> str:
 def _strip_discounts_and_prices(text: str) -> str:
     # поддерживаем -, –, —, − и удаляем ценники любой длины
     text = re.sub(r"[–—\-−]\s?\d{1,2}\s?%", " ", text)
-    text = re.sub(_price_token_regex(), " ", text)
+    text = re.sub(_PRICE_TOKEN_RE, " ", text)
     return text
 
 def extract_sizes_anywhere(text: str) -> str:
@@ -789,7 +902,7 @@ async def handle_album_any(msg: Message):
 async def handle_text(msg: Message):
     txt = msg.text or ""
     # NEW: распознаём цену без знака €
-    has_price_token = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt))
+    has_price_token = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt, flags=re.I))
     has_discount    = bool(re.search(r"[–—\-−]?\s*\d{1,2}\s?%", txt))
     has_pair        = bool(PRICE_DISCOUNT_RE.search(txt))
     has_price = has_pair or has_price_token or has_discount
