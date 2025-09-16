@@ -72,7 +72,7 @@ def _get_q(chat_id: int) -> deque:
     return q
 
 def _arm_batch_timer(chat_id: int, rec: BatchRec):
-    # Если медиа не придут вовремя — публикуем один текст (форвардом)
+    # Если медиа не придут вовремя — ничего не публикуем (чтобы "ничего не улетало")
     if rec.timer:
         rec.timer.cancel()
     async def _fire():
@@ -81,36 +81,49 @@ def _arm_batch_timer(chat_id: int, rec: BatchRec):
         except asyncio.CancelledError:
             return
         q = _get_q(chat_id)
-        if rec in q and not rec.media and rec.text_msg:
+        if rec in q and not rec.media:
             q.remove(rec)
-            await publish_to_target(
-                first_mid=rec.text_msg.message_id,
-                user_id=rec.user_id or (rec.text_msg.from_user.id if rec.text_msg.from_user else 0),
-                items=[{"kind": "forward", "from_chat_id": rec.text_msg.chat.id, "mid": rec.text_msg.message_id, "cap": True}],
-                caption=""
-            )
+            # раньше тут был форвард текста; теперь — тишина
+            return
     rec.timer = asyncio.create_task(_fire())
 
 async def _publish_batch_pair(chat_id: int, rec: BatchRec):
-    # Публикуем: ТЕКСТ → МЕДИА с одинаковым seq (message_id текста)
+    """Публикуем текст и медиа в ТОЧНОМ исходном порядке по message_id."""
     if rec.timer:
         rec.timer.cancel()
-    text_first = rec.text_msg.message_id if rec.text_msg else (rec.media[0]["mid"] if rec.media else 0)
-    user_id = rec.user_id or (rec.text_msg.from_user.id if rec.text_msg and rec.text_msg.from_user else 0)
-    if rec.text_msg:
+    if not rec.text_msg or not rec.media:
+        return
+
+    # Определим порядок (что пришло раньше)
+    text_mid = rec.text_msg.message_id
+    first_media_mid = min(m["mid"] for m in rec.media)
+    user_id = rec.user_id or (rec.text_msg.from_user.id if rec.text_msg.from_user else 0)
+
+    # Общий seq-барьер — минимальный из сообщений партии
+    seq_first = min(text_mid, first_media_mid)
+
+    async def _send_text():
         await publish_to_target(
-            first_mid=text_first,
+            first_mid=seq_first,
             user_id=user_id,
             items=[{"kind": "forward", "from_chat_id": rec.text_msg.chat.id, "mid": rec.text_msg.message_id, "cap": True}],
             caption=""
         )
-    if rec.media:
+
+    async def _send_media():
         await publish_to_target(
-            first_mid=text_first,
+            first_mid=seq_first,
             user_id=user_id,
             items=rec.media,
             caption=""
         )
+
+    if text_mid <= first_media_mid:
+        await _send_text()
+        await _send_media()
+    else:
+        await _send_media()
+        await _send_text()
 
 def _attach_media_to_next_batch(chat_id: int, media_items: List[Dict[str, Any]], user_id: int) -> bool:
     """
@@ -455,7 +468,7 @@ def extract_sizes_anywhere(text: str) -> str:
             b = float(n2).replace(",", ".")  # type: ignore
         except Exception:
             a = float(n1.replace(",", "."))
-            b = float(n2.replace(",", "."))
+            b = float(n2).replace(",", "."))
         lo, hi = sorted((a, b))
         x = lo
         while x <= hi + 1e-9:
@@ -501,7 +514,6 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
         return None
     # оба разделителя присутствуют
     if "," in s and "." in s:
-        # Десятичный — тот, что справа
         if s.rfind(",") > s.rfind("."):
             dec, thou = ",", "."
         else:
@@ -511,22 +523,18 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
             return float(s)
         except ValueError:
             return None
-    # только запятые
     if "," in s and "." not in s:
-        # одиночная запятая и 1–2 цифры справа трактуем как десятичную
         if s.count(",") == 1 and re.search(r",\d{1,2}$", s):
             s = s.replace(",", ".")
             try:
                 return float(s)
             except ValueError:
                 return None
-        # иначе считаем разделителем тысяч
         s = s.replace(",", "")
         try:
             return float(s)
         except ValueError:
             return None
-    # только точки
     if "." in s and "," not in s:
         if s.count(".") == 1 and re.search(r"\.\d{1,2}$", s):
             try:
@@ -538,7 +546,6 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
             return float(s)
         except ValueError:
             return None
-    # только цифры
     try:
         return float(s)
     except ValueError:
@@ -590,28 +597,17 @@ def _is_price_line(l: str) -> bool:
     return bool(re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I))
 
 def pick_sizes_line(lines: List[str]) -> str:
-    """
-    Выбираем лучшую строку с размерами.
-    Приоритет 1: алфавитные размеры или перечисления/диапазоны.
-    Приоритет 2: одиночный числовой размер, НО не вплотную к строке с ценой.
-    """
-
-    # --- Pass 1: «сильные» кандидаты ---
+    # (без изменений)
     for line in lines:
         l = line.strip()
         if not l or _is_price_line(l):
             continue
-        # XS…XXL
         if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I):
             return l
-        # перечисления 39/40/41, 36,5/37, 1,2,3
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
             return l
-        # диапазоны 36-41, 6–10, 1-3
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}\s*[-–/]\s*{SIZE_NUM_ANY}(?!\d)", l):
             return l
-
-    # --- Pass 2: одиночный размер, но не рядом с ценой ---
     for i, line in enumerate(lines):
         l = line.strip()
         if not l or _is_price_line(l):
@@ -622,7 +618,6 @@ def pick_sizes_line(lines: List[str]) -> str:
             if prev_is_price or next_is_price:
                 continue
             return l
-
     return ""
 
 def pick_season_line(lines: List[str]) -> str:
@@ -641,21 +636,15 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     text = cleanup_text_basic(raw_text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # NEW: пробуем универсальный парсер (поддерживает 1360-20%)
     price_uni, discount_uni = parse_price_discount(text)
-
-    # Старые совместимые шаблоны (цена только с €)
     price_m    = re.search(r"(\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*€", text)
     discount_m = re.search(r"[–—\-−]\s*(\d{1,2})\s*%", text)
-    # Позволяем в retail как тысячи, так и десятичные копейки
     retail_m   = re.search(r"Retail\s*price\s*(\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)", text, flags=re.I)
 
-    # Итоговые значения
     price    = price_uni if price_uni is not None else (parse_number_token(price_m.group(1)) if price_m else None)
     discount = discount_uni if discount_uni is not None else (int(discount_m.group(1)) if discount_m else 0)
     retail   = parse_number_token(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
 
-    # Важно: сначала пытаемся вытащить размеры из блока "Размеры:", иначе — эвристики
     sizes_line  = parse_sizes_block(text) or pick_sizes_line(lines) or extract_sizes_anywhere(text)
     season_line = pick_season_line(lines)
 
@@ -675,7 +664,6 @@ def template_five_lines(final_price: int,
                         season_line: str,
                         brand_line: str) -> str:
     line1 = f"✅ <b>{ceil_price(final_price)}€</b>"
-    # Показываем retail только если он не меньше моей цены
     show_retail = bool(retail) and (ceil_price(final_price) <= ceil_price(retail))
     line2 = f"❌ <b>Retail price {ceil_price(retail)}€</b>" if show_retail else ""
     line3 = sizes_line or ""
@@ -701,8 +689,8 @@ def mk_mode(label: str,
 # ====== РЕЖИМЫ ======
 MODES: Dict[str, Dict] = {
     "sale": mk_mode("SALE"),
-    "lux": mk_mode("LUX", calc=lux_calc),          # OCR off
-    "luxocr": mk_mode("LUX OCR", calc=lux_calc),   # OCR on
+    "lux": mk_mode("LUX", calc=lux_calc),
+    "luxocr": mk_mode("LUX OCR", calc=lux_calc),
     "outlet": mk_mode("OUTLET"),
     "stock": mk_mode("STOCK"),
     "newfw": mk_mode("NEW FW"),
@@ -801,7 +789,6 @@ async def handle_single_photo(msg: Message):
     item = {"kind": "photo", "fid": msg.photo[-1].file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
 
-    # Если есть ожидающая партия — прикрепляем и публикуем как пара
     if _attach_media_to_next_batch(msg.chat.id, [item], msg.from_user.id):
         return
 
@@ -877,7 +864,6 @@ async def handle_album_any(msg: Message):
 
         items.sort(key=lambda x: x["mid"])
 
-        # Если есть ожидающая партия и у альбома нет ценовой подписи — прикрепляем к партии
         if not caption:
             if _attach_media_to_next_batch(chat_id, items, user_id):
                 return
@@ -901,24 +887,28 @@ async def handle_album_any(msg: Message):
 @router.message(F.text)
 async def handle_text(msg: Message):
     txt = msg.text or ""
-    # NEW: распознаём цену без знака €
     has_price_token = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt, flags=re.I))
     has_discount    = bool(re.search(r"[–—\-−]?\s*\d{1,2}\s?%", txt))
     has_pair        = bool(PRICE_DISCOUNT_RE.search(txt))
     has_price = has_pair or has_price_token or has_discount
 
     has_custom = any(e.type == MessageEntityType.CUSTOM_EMOJI for e in (msg.entities or []))
+    is_forward = bool(getattr(msg, "forward_origin", None))
     chat_id = msg.chat.id
 
-    # Текст с активными эмодзи без цены — открываем НОВУЮ партию и ждём медиа
-    if not has_pair and not has_price_token and has_custom:
+    # 🔕 ГЛАВНОЕ: пересланные тексты без цены (включая эмодзи) — НЕ публикуем
+    if not has_price and is_forward:
+        return
+
+    # Партии «текст → медиа» оставляем только для НЕпересланных и только для админов
+    if not has_pair and not has_price_token and has_custom and not is_forward and is_admin(msg.from_user.id):
         q = _get_q(chat_id)
         rec = BatchRec(text_msg=msg, user_id=msg.from_user.id)
         q.append(rec)
         _arm_batch_timer(chat_id, rec)
         return
 
-    # Привязка к одиночным медиа, отправленным ранее (окно ALBUM_WINDOW_SECONDS)
+    # Привязка к одиночным медиа, отправленным ранее
     bucket = last_media.get(chat_id)
     if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
         user_id = bucket.get("user_id") or msg.from_user.id
@@ -942,7 +932,7 @@ async def handle_text(msg: Message):
         del last_media[chat_id]
         return
 
-    # Привязка текста к самому свежему альбому этого чата (если ещё «дышит»)
+    # Привязка текста к самому свежему альбому этого чата
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
@@ -976,7 +966,7 @@ async def handle_text(msg: Message):
         return
 
     # Чистые тексты без цены и без custom_emoji — отправляем как текст
-    if not has_price:
+    if not has_price and not has_custom:
         text_item = [{"kind": "text", "fid": "", "mid": msg.message_id, "cap": True}]
         await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=text_item, caption=txt)
         return
