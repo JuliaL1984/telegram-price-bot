@@ -465,10 +465,10 @@ def extract_sizes_anywhere(text: str) -> str:
     def _expand(n1: str, n2: str):
         try:
             a = float(n1.replace(",", "."))
-            b = float(n2).replace(",", ".")  # type: ignore
+            b = float(n2.replace(",", "."))
         except Exception:
             a = float(n1.replace(",", "."))
-            b = float(n2).replace(",", "."))
+            b = float(n2.replace(",", "."))
         lo, hi = sorted((a, b))
         x = lo
         while x <= hi + 1e-9:
