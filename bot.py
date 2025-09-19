@@ -594,20 +594,34 @@ def parse_sizes_block(text: str) -> str:
 
 # --- NEW: определение «ценовой» строки (для эвристик размеров) ---
 def _is_price_line(l: str) -> bool:
-    return bool(re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I))
+    # Уточнённая логика, чтобы не путать строки размеров с ценовыми строками
+    if _PRICE_TOKEN_RE.search(l):
+        return True
+    if re.search(r"[–—\-−]?\s*\d{1,2}\s?%", l):
+        return True
+    if re.search(r"\bretail\b|\bprice\b", l, flags=re.I):
+        return True
+    return False
 
 def pick_sizes_line(lines: List[str]) -> str:
-    # (без изменений)
+    # Выбираем строку с наибольшим числом size-токенов, игнорируя ценовые строки
+    candidates: List[Tuple[int, str]] = []
     for line in lines:
         l = line.strip()
         if not l or _is_price_line(l):
             continue
-        if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I):
-            return l
-        if re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
-            return l
-        if re.search(rf"(?<!\d){SIZE_NUM_ANY}\s*[-–/]\s*{SIZE_NUM_ANY}(?!\d)", l):
-            return l
+        has_alpha = re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I)
+        has_list  = re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l)
+        has_range = re.search(rf"(?<!\d){SIZE_NUM_ANY}\s*[-–/]\s*{SIZE_NUM_ANY}(?!\d)", l)
+        if has_alpha or has_list or has_range:
+            tokens = re.findall(rf"(?:{SIZE_ALPHA}|{SIZE_NUM_ANY})", l, flags=re.I)
+            candidates.append((len(tokens), l))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1].strip()
+
+    # fallback: одиночный размер, если вокруг не ценовые строки
     for i, line in enumerate(lines):
         l = line.strip()
         if not l or _is_price_line(l):
@@ -718,7 +732,7 @@ MODES: Dict[str, Dict] = {
     "flash": mk_mode("FLASH"),
     "bundle": mk_mode("BUNDLE"),
     "limited": mk_mode("LIMITED"),
-    "m1": mk_mode("M1"), "m2": mk_mode("M2"), "m3": mk_mode("M3"), "m4": mk_mode("М4"), "m5": mk_mode("M5"),
+    "m1": mk_mode("M1"), "m2": mk_mode("M2"), "m3": mk_mode("М3"), "m4": mk_mode("М4"), "m5": mk_mode("M5"),
 }
 
 def is_admin(user_id: int) -> bool:
