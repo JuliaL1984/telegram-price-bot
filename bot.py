@@ -31,8 +31,8 @@ ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
 # Базовая политика: в альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
-FILTER_PRICETAGS_IN_ALBUMС = os.getenv("FILTER_PRICETAGS_IN_ALBUMС")
-FILTER_PRICETAGS_IN_ALBUMS = (FILTER_PRICETAGS_IN_ALBUMС == "1") if FILTER_PRICETAGS_IN_ALBUMС is not None else (os.getenv("FILTER_PRICETAGS_IN_ALBUMS","1")=="1")
+FILTER_PRICETAGS_IN_ALБУМС = os.getenv("FILTER_PRICETAGS_IN_ALБУМС")
+FILTER_PRICETAGS_IN_ALBUMS = (FILTER_PRICETAGS_IN_ALБУМС == "1") if FILTER_PRICETAGS_IN_ALБУМС is not None else (os.getenv("FILTER_PRICETAGS_IN_ALBUMS","1")=="1")
 
 # ====== ИНИЦИАЛИЗАЦИЯ ======
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -206,9 +206,11 @@ def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# === РАЗМЕРЫ: EU 30–46 и US 5–12 (с половинками) ===
+# === РАЗМЕРЫ: EU 30–60 и US 5–12 (с половинками) ===
 SIZE_ALPHA   = r"(?:XXS|XS|S|M|L|XL|XXL)"
-SIZE_NUM_EU  = r"(?:3\d|4[0-6])(?:[.,]5)?"
+# >>> изменено: EU 30–60 вместо 30–46
+SIZE_NUM_EU  = r"(?:[3-5]\d|60)(?:[.,]5)?"
+# <<<
 SIZE_NUM_US  = r"(?:[5-9]|1[0-2])(?:[.,]5)?"
 SIZE_NUM_ANY = rf"(?:{SIZE_NUM_EU}|{SIZE_NUM_US})"
 SIZE_TOKEN   = rf"(?:{SIZE_ALPHA}|{SIZE_NUM_ANY})"
@@ -270,12 +272,11 @@ def extract_sizes_anywhere(text: str) -> str:
             continue
         add(norm)
 
-    # >>> tweak: ignore single-number "sizes" to avoid picking quantities like "6"
+    # Игнорируем одиночное число (например, «6» — количество), если нет признаков размеров
     evidence_of_ranges = bool(ranges_dash or ranges_slash)
     has_alpha = bool(singles_alpha)
     if not evidence_of_ranges and not has_alpha and len([p for p in parts if re.fullmatch(r"\d+(?:,\d)?", p)]) == 1:
         return ""
-    # <<< tweak
 
     return ", ".join(parts)
 
