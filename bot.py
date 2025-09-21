@@ -223,26 +223,10 @@ def _strip_discounts_and_prices(text: str) -> str:
     text = re.sub(_price_token_regex(), " ", text)
     return text
 
-# >>> НОВОЕ: вырезаем состав ткани, чтобы числа не попадали в размеры
-_MATERIAL_WORDS = (
-    r"silk|wool|cashmere|cotton|viscose|linen|polyester|nylon|leather|"
-    r"elastane|spandex|polyamide|acrylic|angora|alpaca|mohair|down|feather|"
-    r"rayon|cupro|modal|lyocell|tencel|suede|denim|satin|velvet"
-)
-_COMPOSITION_REGEX = re.compile(
-    rf"(?i)(?:\b\d{{1,3}}(?:[.,]\d{{1,2}})?\s*%\s*(?:{_MATERIAL_WORDS})\b)"
-)
-
-def _strip_fabric_composition(text: str) -> str:
-    # Удаляем пары «NN% material» и их повторения внутри строки.
-    return _COMPOSITION_REGEX.sub(" ", text)
-# <<< НОВОЕ
-
 def extract_sizes_anywhere(text: str) -> str:
     """Достаём размеры из любого места, сохраняя порядок и без дублей."""
     work = _strip_seasons_for_size_scan(text)
     work = _strip_discounts_and_prices(work)
-    work = _strip_fabric_composition(work)  # <<< НОВОЕ: исключаем состав ткани
 
     # Диапазоны: "36-41", "36/41", "6-10", "6/10"
     ranges_dash  = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})\s*[-–—]\s*({SIZE_NUM_ANY})(?!\d)", work)
@@ -319,6 +303,45 @@ def pick_season_line(lines: List[str]) -> str:
             return line.strip()
     return ""
 
+# >>> materials: извлекаем материалы и проценты (silk, wool, cotton, cashmere, linen и пр.)
+MATERIAL_KEYWORDS = [
+    "silk","wool","cotton","cashmere","linen","leather","suede","denim","canvas",
+    "viscose","rayon","polyester","nylon","polyamide","acrylic","acetate","elastane","spandex",
+    "mohair","alpaca","angora","down","feather","goose down","merino","rubber","lyocell","tencel"
+]
+
+MATERIAL_RE = re.compile(
+    r"(?:(\d{1,3})\s*%\s*)?(?:"
+    r"(silk|wool|cotton|cashmere|linen|leather|suede|denim|canvas|viscose|rayon|polyester|nylon|polyamide|acrylic|acetate|elastane|spandex|mohair|alpaca|angora|down|feather|goose\s+down|merino|rubber|lyocell|tencel)"
+    r")",
+    flags=re.I
+)
+
+def extract_materials_line(text: str) -> str:
+    """
+    Возвращаем строку материалов, сохраняя порядок появления.
+    Поддерживает '60% silk 40% wool', 'silk wool', 'cashmere 100%' (первый вариант приоритет).
+    """
+    parts: List[str] = []
+    used = set()
+    # Сначала ищем пары с процентами
+    for m in MATERIAL_RE.finditer(text):
+        pct, mat = m.group(1), m.group(2)
+        mat_clean = re.sub(r"\s+", " ", mat.strip()).lower()
+        if pct:
+            token = f"{pct}% {mat_clean}"
+        else:
+            token = mat_clean
+        if token not in used:
+            parts.append(token)
+            used.add(token)
+
+    # Нормализация регистра: материалы маленькими буквами (как прислали), проценты — как есть
+    # Объединяем ', '
+    # Если нашлись только слова без %, тоже вернём их (SILK WOOL и т.п.)
+    return ", ".join(parts)
+# <<< materials
+
 def parse_number_token(token: Optional[str]) -> Optional[float]:
     if not token:
         return None
@@ -338,8 +361,9 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     discount = int(discount_m.group(1)) if discount_m else 0
     retail   = parse_number_token(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
 
-    sizes_line  = pick_sizes_line(lines) or extract_sizes_anywhere(text)
-    season_line = pick_season_line(lines)
+    sizes_line     = pick_sizes_line(lines) or extract_sizes_anywhere(text)
+    season_line    = pick_season_line(lines)
+    materials_line = extract_materials_line(text)  # >>> materials
 
     return {
         "price": price,
@@ -347,6 +371,7 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
         "retail": retail,
         "sizes_line": sizes_line,
         "season_line": season_line,
+        "materials_line": materials_line,  # >>> materials
         "brand_line": "",
         "cleaned_text": text,
     }
@@ -355,12 +380,19 @@ def template_five_lines(final_price: int,
                         retail: float,
                         sizes_line: str,
                         season_line: str,
-                        brand_line: str) -> str:
+                        brand_line: str,
+                        materials_line: str = "") -> str:  # >>> materials (параметр по умолчанию)
+    # Линии:
+    # 1 — цена, 2 — retail, 3 — размеры, 4 — материалы ИЛИ сезон (если материалов нет), 5 — сезон (если материалы есть)
     line1 = f"✅ <b>{ceil_price(final_price)}€</b>"
     line2 = f"❌ <b>Retail price {ceil_price(retail)}€</b>"
     line3 = sizes_line or ""
-    line4 = season_line or ""
-    line5 = ""
+    if materials_line:
+        line4 = materials_line
+        line5 = season_line or ""
+    else:
+        line4 = season_line or ""
+        line5 = ""
     lines = [line1, line2, line3, line4, line5]
     cleaned = []
     for s in lines:
@@ -390,7 +422,7 @@ MODES: Dict[str, Dict] = {
     "bags20": mk_mode("BAGS -20%"),
     "bags25": mk_mode("BAGS -25%"),
     "bags30": mk_mode("BAGS -30%"),
-    "bags40": mk_mode("БAGS -40%"),
+    "bags40": mk_mode("BAGS -40%"),
     "shoes10": mk_mode("SHOES -10%"),
     "shoes20": mk_mode("SHOES -20%"),
     "shoes30": mk_mode("SHOES -30%"),
@@ -462,6 +494,7 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
         sizes_line=data.get("sizes_line", "") or "",
         season_line=data.get("season_line", "") or "",
         brand_line="",
+        materials_line=data.get("materials_line", "") or ""  # >>> materials
     )
 
 # ====== ХЕЛПЕР ======
