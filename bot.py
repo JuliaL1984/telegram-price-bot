@@ -313,7 +313,9 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     price_m    = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
-    discount_m = re.search(r"-(\d+)%", text)
+    # >>> обновлено: допускаем любые тире и эмодзи после %
+    discount_m = re.search(r"[-−–—]\s*(\d{1,2})\s*%(?=\D|$)", text)
+    # <<<
     retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
 
     price    = parse_number_token(price_m.group(1)) if price_m else None
@@ -604,7 +606,7 @@ async def handle_text(msg: Message):
 
     # Чистые тексты — переслать как есть
     txt = msg.text or ""
-    has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"-(\d+)\s?%", txt))
+    has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"[-−–—]\s*(\d{1,2})\s*%(?=\D|$)", txt))
     if not has_price:
         seq = alloc_seq()
         text_item = [{"kind": "text", "fid": "", "mid": msg.message_id, "cap": True}]
