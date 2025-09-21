@@ -223,10 +223,26 @@ def _strip_discounts_and_prices(text: str) -> str:
     text = re.sub(_price_token_regex(), " ", text)
     return text
 
+# >>> НОВОЕ: вырезаем состав ткани, чтобы числа не попадали в размеры
+_MATERIAL_WORDS = (
+    r"silk|wool|cashmere|cotton|viscose|linen|polyester|nylon|leather|"
+    r"elastane|spandex|polyamide|acrylic|angora|alpaca|mohair|down|feather|"
+    r"rayon|cupro|modal|lyocell|tencel|suede|denim|satin|velvet"
+)
+_COMPOSITION_REGEX = re.compile(
+    rf"(?i)(?:\b\d{{1,3}}(?:[.,]\d{{1,2}})?\s*%\s*(?:{_MATERIAL_WORDS})\b)"
+)
+
+def _strip_fabric_composition(text: str) -> str:
+    # Удаляем пары «NN% material» и их повторения внутри строки.
+    return _COMPOSITION_REGEX.sub(" ", text)
+# <<< НОВОЕ
+
 def extract_sizes_anywhere(text: str) -> str:
     """Достаём размеры из любого места, сохраняя порядок и без дублей."""
     work = _strip_seasons_for_size_scan(text)
     work = _strip_discounts_and_prices(work)
+    work = _strip_fabric_composition(work)  # <<< НОВОЕ: исключаем состав ткани
 
     # Диапазоны: "36-41", "36/41", "6-10", "6/10"
     ranges_dash  = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})\s*[-–—]\s*({SIZE_NUM_ANY})(?!\d)", work)
@@ -374,7 +390,7 @@ MODES: Dict[str, Dict] = {
     "bags20": mk_mode("BAGS -20%"),
     "bags25": mk_mode("BAGS -25%"),
     "bags30": mk_mode("BAGS -30%"),
-    "bags40": mk_mode("BAGS -40%"),
+    "bags40": mk_mode("БAGS -40%"),
     "shoes10": mk_mode("SHOES -10%"),
     "shoes20": mk_mode("SHOES -20%"),
     "shoes30": mk_mode("SHOES -30%"),
