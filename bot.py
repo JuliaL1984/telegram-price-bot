@@ -107,20 +107,25 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
 async def publish_worker():
     global _next_to_publish
     while True:
+        # Забираем задачу из очереди
         payload = await publish_queue.get()
-        seq = payload[0]
-        _pending[seq] = payload
-        publish_queue.task_done()
+        try:
+            seq = payload[0]
+            _pending[seq] = payload
 
-        # Публикуем строго по seq
-        while _next_to_publish in _pending:
-            s, first_mid, user_id, items, caption, album_ocr_on = _pending.pop(_next_to_publish)
-            try:
-                await _do_publish(user_id, items, caption, album_ocr_on)
-            except Exception:
-                pass
-            finally:
-                _next_to_publish += 1
+            # Публикуем строго по seq
+            while _next_to_publish in _pending:
+                s, first_mid, user_id, items, caption, album_ocr_on = _pending.pop(_next_to_publish)
+                try:
+                    await _do_publish(user_id, items, caption, album_ocr_on)
+                except Exception:
+                    # Не даём очереди «залипнуть» на одном посте
+                    pass
+                finally:
+                    _next_to_publish += 1
+        finally:
+            # FIX: task_done только когда мы реально обработали «батч»
+            publish_queue.task_done()
 
 async def publish_to_target(seq: int, first_mid: int, user_id: int, items: List[Dict[str, Any]], caption: str):
     album_ocr_on = is_ocr_enabled_for(user_id)
@@ -567,7 +572,10 @@ async def handle_album_any(msg: Message):
         buf["caption"] = cap_text
 
     if buf["task"]:
-        buf["task"].cancel()
+        try:
+            buf["task"].cancel()
+        except Exception:
+            pass
 
     async def _flush_album():
         await asyncio.sleep(ALBUM_SETTLE_MS / 1000)
@@ -642,7 +650,10 @@ async def handle_text(msg: Message):
         result = build_result_text(user_id, caption)
 
         if data.get("task"):
-            data["task"].cancel()
+            try:
+                data["task"].cancel()
+            except Exception:
+                pass
         album_buffers.pop(key, None)
 
         if result:
