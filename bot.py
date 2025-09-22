@@ -65,7 +65,7 @@ def is_ocr_enabled_for(user_id: int) -> bool:
     /luxocr   -> OCR on  для альбомов
     остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALBUMS
     """
-    mode = active_mode.get(user_id, "sale")
+    mode = active_mode.get(user_id, "lux")  # <<< default LUX
     if mode == "lux":
         return False
     if mode == "luxocr":
@@ -408,7 +408,7 @@ def mk_mode(label: str,
 
 # ====== РЕЖИМЫ ======
 MODES: Dict[str, Dict] = {
-    "sale": mk_mode("SALE"),
+    # "sale": mk_mode("SALE"),  # <<< удалено
     "lux": mk_mode("LUX", calc=lux_calc),          # OCR off
     "luxocr": mk_mode("LUX OCR", calc=lux_calc),   # OCR on
     "outlet": mk_mode("OUTLET"),
@@ -458,8 +458,8 @@ async def set_mode(msg: Message):
 @router.message(Command("mode"))
 async def show_mode(msg: Message):
     user_id = msg.from_user.id
-    mode_key = active_mode.get(user_id, "sale")
-    label = MODES.get(mode_key, MODES["sale"])["label"]
+    mode_key = active_mode.get(user_id, "lux")  # <<< default LUX
+    label = MODES.get(mode_key, MODES["lux"])["label"]  # <<< default LUX
     ocr_state = "ON" if is_ocr_enabled_for(user_id) else "OFF"
     await msg.answer(f"Текущий режим: <b>{label}</b>\nOCR в альбомах: <b>{ocr_state}</b>")
 
@@ -483,7 +483,7 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
     price = data.get("price")
     if price is None:
         return None
-    mode = MODES.get(active_mode.get(user_id, "sale"), MODES["sale"])
+    mode = MODES.get(active_mode.get(user_id, "lux"), MODES["lux"])  # <<< default LUX
     calc_fn, tpl_fn, _label = mode["calc"], mode["template"], mode["label"]
     final_price = calc_fn(float(price), int(data.get("discount", 0)))
     return tpl_fn(
