@@ -20,7 +20,9 @@ from aiogram.types import Message, InputMediaPhoto, InputMediaVideo
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
-from aiogram.utils.exceptions import FloodWait, RetryAfter, Throttled
+# >>> aiogram v3: корректные исключения
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramForbiddenError
+# <<<
 
 # ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -83,19 +85,26 @@ def is_ocr_enabled_for(user_id: int) -> bool:
 
 # ====== БЕЗОПАСНАЯ ОТПРАВКА + РАЗБИЕНИЕ НА 10 ======
 async def safe_send(coro, *args, **kwargs):
-    """Повторная отправка при FloodWait/RetryAfter/Throttled с ограничением по времени."""
+    """Повторная отправка при лимитах Telegram (aiogram v3 исключения)."""
     tries = 0
     while True:
         try:
             return await coro(*args, **kwargs)
-        except (FloodWait, RetryAfter, Throttled) as e:
+        # Flood/Rate limit
+        except TelegramRetryAfter as e:
             tries += 1
             if tries > SEND_MAX_RETRIES:
                 raise
-            delay = int(getattr(e, "timeout", getattr(e, "value", 3))) + 1
+            delay = int(getattr(e, "retry_after", 3)) + 1
             if delay > SEND_MAX_DELAY:
                 delay = SEND_MAX_DELAY
             await asyncio.sleep(delay)
+        # Нет прав в целевом чате — ретраить бессмысленно
+        except TelegramForbiddenError:
+            raise
+        # Прочие ошибки Telegram API
+        except TelegramAPIError:
+            raise
 
 def chunk_media(items: List[Dict[str, Any]]) -> List[List[Any]]:
     """Преобразует словари items в InputMedia и бьёт на чанки по 10."""
@@ -139,7 +148,7 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
 
     for ch in chunks:
         await safe_send(bot.send_media_group, TARGET_CHAT_ID, ch)
-        # небольшая пауза между батчами снижает шанс FloodWait
+        # небольшая пауза между батчами снижает шанс лимитов
         await asyncio.sleep(0.3)
 
 async def publish_worker():
@@ -511,31 +520,12 @@ async def show_help(msg: Message):
         "• /lux — OCR выключен, /luxocr — OCR включен.\n"
         "• Формула: ≤250€ +55€; 251–400€ +70€; >400€ → +10% и +30€. Всё округляем вверх.\n"
         "• Альбом без подписи публикуется сразу.\n"
-        "• /mode — показать текущий режим и состояние OCR.\n"
-        "• /reset — очистить буферы и очередь (служебная команда)."
+        "• /mode — показать текущий режим и состояние OCR."
     )
 
 @router.message(Command("ping"))
 async def ping(msg: Message):
     await msg.answer("pong")
-
-@router.message(Command("reset"))
-async def reset_cmd(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return await msg.answer("⛔ Только для админов.")
-    # чистим буферы альбомов
-    n_buf = len(album_buffers)
-    album_buffers.clear()
-    # чистим очередь публикаций
-    cleared = 0
-    while not publish_queue.empty():
-        try:
-            publish_queue.get_nowait()
-            publish_queue.task_done()
-            cleared += 1
-        except Exception:
-            break
-    await msg.answer(f"Очистили буферы ({n_buf}) и очередь ({cleared}) ✅")
 
 # ====== СБОРКА ПОДПИСИ ======
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
@@ -744,11 +734,9 @@ async def albums_watchdog():
             started_at = data.get("started_at", now)
             # если слишком долго «держим» альбом — флашим тем, что есть
             if now - started_at >= ALBUM_TIMEOUT_SECONDS:
-                # снимаем локальный дебаунс, если был
                 task = data.get("task")
                 if task:
                     task.cancel()
-                # воспроизводим локальную логику _flush_album
                 album_buffers.pop(key, None)
 
                 items: List[Dict[str, Any]] = data.get("items", [])
