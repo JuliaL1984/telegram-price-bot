@@ -11,6 +11,7 @@ import re
 import io
 import math
 import asyncio
+import time
 from typing import Dict, Callable, Optional, List, Tuple, Any
 from datetime import datetime, timedelta
 
@@ -19,6 +20,7 @@ from aiogram.types import Message, InputMediaPhoto, InputMediaVideo
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
+from aiogram.utils.exceptions import FloodWait, RetryAfter, Throttled
 
 # ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -27,6 +29,12 @@ ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
 ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "1500"))  # стабильнее собирает альбомы
 ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
+# Таймаут на принудительный флаш "залипшего" альбома (watchdog)
+ALBUM_TIMEOUT_SECONDS = int(os.getenv("ALBUM_TIMEOUT_SECONDS", "12"))
+
+# Отправка: максимум повторов при FloodWait/RetryAfter/Throttled
+SEND_MAX_RETRIES = int(os.getenv("SEND_MAX_RETRIES", "3"))
+SEND_MAX_DELAY = int(os.getenv("SEND_MAX_DELAY", "30"))  # верхняя граница ожидания при фловде, сек
 
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
@@ -44,6 +52,7 @@ dp.include_router(router)
 # MediaItem: {"kind": "photo"|"video", "fid": str, "mid": int, "cap": bool}
 last_media: Dict[int, Dict[str, Any]] = {}
 active_mode: Dict[int, str] = {}
+# В буфере альбомов дополнительно храним started_at для watchdog
 album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
 # ====== STRICT GLOBAL SEQ (без обгонов между постами) ======
@@ -72,6 +81,34 @@ def is_ocr_enabled_for(user_id: int) -> bool:
         return True
     return FILTER_PRICETAGS_IN_ALBUMS
 
+# ====== БЕЗОПАСНАЯ ОТПРАВКА + РАЗБИЕНИЕ НА 10 ======
+async def safe_send(coro, *args, **kwargs):
+    """Повторная отправка при FloodWait/RetryAfter/Throttled с ограничением по времени."""
+    tries = 0
+    while True:
+        try:
+            return await coro(*args, **kwargs)
+        except (FloodWait, RetryAfter, Throttled) as e:
+            tries += 1
+            if tries > SEND_MAX_RETRIES:
+                raise
+            delay = int(getattr(e, "timeout", getattr(e, "value", 3))) + 1
+            if delay > SEND_MAX_DELAY:
+                delay = SEND_MAX_DELAY
+            await asyncio.sleep(delay)
+
+def chunk_media(items: List[Dict[str, Any]]) -> List[List[Any]]:
+    """Преобразует словари items в InputMedia и бьёт на чанки по 10."""
+    media: List[Any] = []
+    for it in items:
+        if it["kind"] == "video":
+            media.append(InputMediaVideo(media=it["fid"]))
+        else:
+            media.append(InputMediaPhoto(media=it["fid"]))
+    # чанки по 10 — лимит Telegram для media_group
+    chunks = [media[i:i+10] for i in range(0, len(media), 10)]
+    return chunks
+
 async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, album_ocr_on: bool):
     """Реальная отправка сообщений (фото/видео/альбомы/текст)."""
     if not items:
@@ -79,30 +116,31 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
 
     # текстовый пост «как есть»
     if items and items[0].get("kind") == "text":
-        await bot.send_message(TARGET_CHAT_ID, caption or "")
+        await safe_send(bot.send_message, TARGET_CHAT_ID, caption or "")
         return
 
     # OCR-фильтрация только для альбомов при album_ocr_on=True
     items = await filter_pricetag_media(items, album_ocr_on)
 
+    # Одиночные
     if len(items) == 1:
         it = items[0]
         if it["kind"] == "video":
-            await bot.send_video(TARGET_CHAT_ID, it["fid"], caption=caption)
+            await safe_send(bot.send_video, TARGET_CHAT_ID, it["fid"], caption=caption)
         else:
-            await bot.send_photo(TARGET_CHAT_ID, it["fid"], caption=caption)
+            await safe_send(bot.send_photo, TARGET_CHAT_ID, it["fid"], caption=caption)
         return
 
-    # Альбом: подпись к первому
-    first = items[0]
-    media = []
-    if first["kind"] == "video":
-        media.append(InputMediaVideo(media=first["fid"], caption=caption, parse_mode=ParseMode.HTML))
-    else:
-        media.append(InputMediaPhoto(media=first["fid"], caption=caption, parse_mode=ParseMode.HTML))
-    for it in items[1:]:
-        media.append(InputMediaVideo(media=it["fid"]) if it["kind"] == "video" else InputMediaPhoto(media=it["fid"]))
-    await bot.send_media_group(TARGET_CHAT_ID, media)
+    # Альбом: разбиваем по 10; подпись — у первого элемента ПЕРВОГО чанка
+    chunks = chunk_media(items)
+    if caption and chunks and chunks[0]:
+        chunks[0][0].caption = caption
+        chunks[0][0].parse_mode = ParseMode.HTML
+
+    for ch in chunks:
+        await safe_send(bot.send_media_group, TARGET_CHAT_ID, ch)
+        # небольшая пауза между батчами снижает шанс FloodWait
+        await asyncio.sleep(0.3)
 
 async def publish_worker():
     global _next_to_publish
@@ -118,6 +156,7 @@ async def publish_worker():
             try:
                 await _do_publish(user_id, items, caption, album_ocr_on)
             except Exception:
+                # проглатываем, чтобы не залипал барьер; но seq всё равно двигаем
                 pass
             finally:
                 _next_to_publish += 1
@@ -472,12 +511,31 @@ async def show_help(msg: Message):
         "• /lux — OCR выключен, /luxocr — OCR включен.\n"
         "• Формула: ≤250€ +55€; 251–400€ +70€; >400€ → +10% и +30€. Всё округляем вверх.\n"
         "• Альбом без подписи публикуется сразу.\n"
-        "• /mode — показать текущий режим и состояние OCR."
+        "• /mode — показать текущий режим и состояние OCR.\n"
+        "• /reset — очистить буферы и очередь (служебная команда)."
     )
 
 @router.message(Command("ping"))
 async def ping(msg: Message):
     await msg.answer("pong")
+
+@router.message(Command("reset"))
+async def reset_cmd(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return await msg.answer("⛔ Только для админов.")
+    # чистим буферы альбомов
+    n_buf = len(album_buffers)
+    album_buffers.clear()
+    # чистим очередь публикаций
+    cleared = 0
+    while not publish_queue.empty():
+        try:
+            publish_queue.get_nowait()
+            publish_queue.task_done()
+            cleared += 1
+        except Exception:
+            break
+    await msg.answer(f"Очистили буферы ({n_buf}) и очередь ({cleared}) ✅")
 
 # ====== СБОРКА ПОДПИСИ ======
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
@@ -561,13 +619,22 @@ async def handle_album_any(msg: Message):
     buf = album_buffers.get(key)
     if not buf:
         seq = alloc_seq()
-        buf = {"items": [], "caption": "", "task": None, "user_id": msg.from_user.id, "seq": seq, "first_mid": msg.message_id}
+        buf = {
+            "items": [],
+            "caption": "",
+            "task": None,
+            "user_id": msg.from_user.id,
+            "seq": seq,
+            "first_mid": msg.message_id,
+            "started_at": time.monotonic(),  # для watchdog
+        }
         album_buffers[key] = buf
 
     buf["items"].append({"kind": kind, "fid": fid, "mid": msg.message_id, "cap": has_cap})
     if has_cap and not buf["caption"]:
         buf["caption"] = cap_text
 
+    # перезапускаем локальный дебаунс на флаш
     if buf["task"]:
         buf["task"].cancel()
 
@@ -664,10 +731,50 @@ async def handle_text(msg: Message):
 
     return
 
+# ====== WATCHDOG: принудительный флаш "залипших" альбомов ======
+async def albums_watchdog():
+    while True:
+        await asyncio.sleep(5)
+        now = time.monotonic()
+        keys = list(album_buffers.keys())
+        for key in keys:
+            data = album_buffers.get(key)
+            if not data:
+                continue
+            started_at = data.get("started_at", now)
+            # если слишком долго «держим» альбом — флашим тем, что есть
+            if now - started_at >= ALBUM_TIMEOUT_SECONDS:
+                # снимаем локальный дебаунс, если был
+                task = data.get("task")
+                if task:
+                    task.cancel()
+                # воспроизводим локальную логику _flush_album
+                album_buffers.pop(key, None)
+
+                items: List[Dict[str, Any]] = data.get("items", [])
+                caption = data.get("caption", "")
+                user_id = data.get("user_id")
+                seq = data.get("seq", alloc_seq())
+                first_mid = data.get("first_mid", items[0]["mid"] if items else int(now))
+
+                items.sort(key=lambda x: x["mid"])
+
+                if caption:
+                    result = build_result_text(user_id, caption)
+                    if result:
+                        await publish_to_target(seq, first_mid, user_id, items, result)
+                    else:
+                        await publish_to_target(seq, first_mid, user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{caption}")
+                else:
+                    await publish_to_target(seq, first_mid, user_id, items, "")
+
 # ====== ЗАПУСК ======
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
+    # воркер публикаций
     asyncio.create_task(publish_worker())
+    # сторож залипов альбомов
+    asyncio.create_task(albums_watchdog())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
