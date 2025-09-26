@@ -11,6 +11,7 @@ import re
 import io
 import math
 import asyncio
+import signal  # <<< добавлено
 from typing import Dict, Callable, Optional, List, Tuple, Any
 from datetime import datetime, timedelta
 
@@ -673,11 +674,31 @@ async def handle_text(msg: Message):
 
     return
 
-# ====== ЗАПУСК ======
+# ====== ЗАПУСК (Render-friendly polling с graceful shutdown) ======
 async def main():
+    # Снимаем возможный вебхук и чистим подвисшие апдейты перед polling
     await bot.delete_webhook(drop_pending_updates=True)
+    # Запускаем фонового публикационного работника
     asyncio.create_task(publish_worker())
+    # Стартуем polling ровно один раз
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+
+    # Корректное завершение при деплое на Render
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, loop.stop)
+        except NotImplementedError:
+            pass
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        # Закрываем HTTP-сессию Telegram-клиента
+        try:
+            loop.run_until_complete(bot.session.close())
+        except Exception:
+            pass
+        loop.close()
