@@ -653,14 +653,43 @@ async def handle_text(msg: Message):
         await publish_to_target(seq, msg.message_id, msg.from_user.id, text_item, txt)
         return
 
+# ====== ДИАГНОСТИКА ВЕБХУКА ======
+async def _webhook_dance_and_diag():
+    try:
+        me = await bot.get_me()
+        print(f"[DIAG] Bot: id={me.id} username=@{me.username}")
+
+        info_before = await bot.get_webhook_info()
+        print(f"[DIAG] Webhook BEFORE: url='{info_before.url}' pending={info_before.pending_update_count}")
+
+        # ставим фиктивный вебхук, затем снимаем — чтобы обнулить возможные подвисания
+        fake_url = f"https://example.com/{me.id}/stub"
+        try:
+            await bot.set_webhook(url=fake_url, allowed_updates=[])
+            print(f"[DIAG] set_webhook(fake) OK -> {fake_url}")
+        except Exception as e:
+            print(f"[DIAG] set_webhook(fake) ERROR: {e}")
+
+        info_mid = await bot.get_webhook_info()
+        print(f"[DIAG] Webhook MID: url='{info_mid.url}' pending={info_mid.pending_update_count}")
+
+        await bot.delete_webhook(drop_pending_updates=True)
+        print("[DIAG] delete_webhook(drop_pending_updates=True) OK")
+
+        info_after = await bot.get_webhook_info()
+        print(f"[DIAG] Webhook AFTER: url='{info_after.url}' pending={info_after.pending_update_count}")
+    except Exception as e:
+        print(f"[DIAG] webhook dance failed: {e}")
+
 # ====== ХУКИ ЗАПУСКА/ОСТАНОВКИ ======
 _publish_task: Optional[asyncio.Task] = None
 
 @dp.startup()
 async def _on_startup():
     global _publish_task
-    print("[STARTUP] dropping webhook & starting worker")
-    await bot.delete_webhook(drop_pending_updates=True)
+    print("[STARTUP] webhook dance & starting worker")
+    # Диагностика вебхука (set→info→delete→info) + печать бота
+    await _webhook_dance_and_diag()
     _publish_task = asyncio.create_task(publish_worker())
 
 @dp.shutdown()
