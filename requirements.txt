@@ -1,4 +1,1 @@
 aiogram==3.7.0
-Pillow==10.4.0
-pytesseract==0.3.10
-python-dotenv==1.0.1 by
