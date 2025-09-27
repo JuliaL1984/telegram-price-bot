@@ -69,18 +69,22 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
     if not items:
         return
 
+    # Текстовый «альбом»
     if items and items[0].get("kind") == "text":
         await bot.send_message(TARGET_CHAT_ID, caption or "")
         return
 
+    # Фильтрация ценников в альбомах (OCR)
     items = await filter_pricetag_media(items, album_ocr_on)
 
+    # Отправки
     if len(items) == 1:
         it = items[0]
         if it["kind"] == "video":
             await bot.send_video(TARGET_CHAT_ID, it["fid"], caption=caption)
         else:
             await bot.send_photo(TARGET_CHAT_ID, it["fid"], caption=caption)
+        await asyncio.sleep(0.2)  # анти-флуд
         return
 
     first = items[0]
@@ -89,26 +93,33 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
         media.append(InputMediaVideo(media=first["fid"], caption=caption, parse_mode=ParseMode.HTML))
     else:
         media.append(InputMediaPhoto(media=first["fid"], caption=caption, parse_mode=ParseMode.HTML))
-    
     for it in items[1:]:
         if it["kind"] == "video":
             media.append(InputMediaVideo(media=it["fid"]))
         else:
             media.append(InputMediaPhoto(media=it["fid"]))
-    
+
     await bot.send_media_group(TARGET_CHAT_ID, media)
+    await asyncio.sleep(0.3)  # анти-флуд для групп
 
 async def publish_worker():
+    """
+    Последовательно публикуем пачки с глобальной упорядоченностью.
+    ВАЖНО: task_done() ставим только если payload реально получен
+    (это убирает редкий deadlock, когда finally вызывался без get()).
+    """
     global _next_to_publish
     while True:
+        payload = None
         try:
             payload = await publish_queue.get()
             seq = payload[0]
             _pending[seq] = payload
-            
+            # Подчищаем и публикуем по порядку
             while _next_to_publish in _pending:
                 s, first_mid, user_id, items, caption, album_ocr_on = _pending.pop(_next_to_publish)
                 try:
+                    print(f"[PUB] seq={s} mid={first_mid} nitems={len(items)} ocr={album_ocr_on}")
                     await _do_publish(user_id, items, caption, album_ocr_on)
                 except Exception as e:
                     print(f"Ошибка при публикации: {e}")
@@ -117,20 +128,22 @@ async def publish_worker():
         except Exception as e:
             print(f"Ошибка в publish_worker: {e}")
         finally:
-            try:
-                publish_queue.task_done()
-            except Exception:
-                pass
+            if payload is not None:
+                try:
+                    publish_queue.task_done()
+                except Exception:
+                    pass
 
 async def publish_to_target(seq: int, first_mid: int, user_id: int, items: List[Dict[str, Any]], caption: str):
     album_ocr_on = is_ocr_enabled_for(user_id)
-    await publish_queue.put((seq, first_mid, user_id, items, caption, album_ocr_on))
+    # Кладём копию списка, чтобы фоновые задачи не делили один и тот же объект
+    await publish_queue.put((seq, first_mid, user_id, list(items), caption, album_ocr_on))
 
 # ====== OCR ======
 if OCR_ENABLED:
     try:
         import pytesseract
-        from PIL import Image
+        from PIL import Image  # noqa: F401
     except Exception:
         OCR_ENABLED = False
 
@@ -153,7 +166,8 @@ async def ocr_should_hide(file_id: str) -> bool:
         has_price_token = bool(re.search(_price_token_regex(), txt))
         has_kw = ("retail" in tl) or ("price" in tl) or ("prezzo" in tl) or ("%" in txt)
         return bool(has_price_token and has_kw)
-    except Exception:
+    except Exception as e:
+        print(f"OCR fail (skip): {e}")
         return False
 
 async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool) -> List[Dict[str, Any]]:
@@ -468,7 +482,7 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
 async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[str, Any]], mgid: Optional[str] = None, caption: str = "", seq: Optional[int] = None):
     last_media[chat_id] = {
         "ts": datetime.now(),
-        "items": items,
+        "items": list(items),  # копия
         "caption": caption or "",
         "mgid": mgid or "",
         "user_id": user_id,
@@ -481,6 +495,7 @@ async def handle_single_photo(msg: Message):
     seq = alloc_seq()
     item = {"kind": "photo", "fid": msg.photo[-1].file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
+    print(f"[SINGLE PHOTO] mid={msg.message_id} cap={bool(caption)}")
     if caption:
         result = build_result_text(msg.from_user.id, caption)
         if result:
@@ -497,6 +512,7 @@ async def handle_single_video(msg: Message):
     seq = alloc_seq()
     item = {"kind": "video", "fid": msg.video.file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
+    print(f"[SINGLE VIDEO] mid={msg.message_id} cap={bool(caption)}")
     if caption:
         result = build_result_text(msg.from_user.id, caption)
         if result:
@@ -530,6 +546,7 @@ async def handle_album_any(msg: Message):
         seq = alloc_seq()
         buf = {"items": [], "caption": "", "task": None, "user_id": msg.from_user.id, "seq": seq, "first_mid": msg.message_id}
         album_buffers[key] = buf
+        print(f"[ALBUM START] mgid={mgid} seq={seq}")
 
     buf["items"].append({"kind": kind, "fid": fid, "mid": msg.message_id, "cap": has_cap})
     if has_cap and not buf["caption"]:
@@ -554,6 +571,7 @@ async def handle_album_any(msg: Message):
         first_mid = data["first_mid"]
 
         items.sort(key=lambda x: x["mid"])
+        print(f"[ALBUM FLUSH] mgid={mgid} seq={seq} n={len(items)} cap={bool(caption)}")
 
         if caption:
             result = build_result_text(user_id, caption)
@@ -581,7 +599,7 @@ async def handle_text(msg: Message):
         raw_text += (msg.text or "")
 
         result = build_result_text(user_id, raw_text)
-        items: List[Dict[str, Any]] = bucket.get("items") or []
+        items: List[Dict[str, Any]] = list(bucket.get("items") or [])
         first_mid = min(it["mid"] for it in items) if items else msg.message_id
 
         if result:
@@ -592,6 +610,7 @@ async def handle_text(msg: Message):
         del last_media[chat_id]
         return
 
+    # Подцепляем текст к альбому, который ещё «оседает»
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
@@ -625,6 +644,7 @@ async def handle_text(msg: Message):
             await publish_to_target(seq, first_mid, user_id, items, f"⚠️ Не нашла цену в тексте. Пример: 650€ -35%\n\n{msg.text}")
         return
 
+    # Обычный текст — публикуем как есть (для общего текста в ленту)
     txt = msg.text or ""
     has_price = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt)) or bool(re.search(r"[-−–—]\s*(\d{1,2})\s*%(?=\D|$)", txt))
     if not has_price:
@@ -639,12 +659,14 @@ _publish_task: Optional[asyncio.Task] = None
 @dp.startup()
 async def _on_startup():
     global _publish_task
+    print("[STARTUP] dropping webhook & starting worker")
     await bot.delete_webhook(drop_pending_updates=True)
     _publish_task = asyncio.create_task(publish_worker())
 
 @dp.shutdown()
 async def _on_shutdown():
     global _publish_task
+    print("[SHUTDOWN] stopping worker")
     try:
         if _publish_task and not _publish_task.done():
             _publish_task.cancel()
