@@ -644,13 +644,13 @@ async def _on_startup():
     global _publish_task
     # Снимаем вебхук, чтобы гарантированно уйти в polling и отрезать чужие сеансы
     await bot.delete_webhook(drop_pending_updates=True)
-    # Запускаем рабочего
-    _publish_task = asyncio.create_task(publish_worker())
+    # Запускаем рабочего — ТОЛЬКО если еще не запущен
+    if _publish_task is None or _publish_task.done():
+        _publish_task = asyncio.create_task(publish_worker())
 
 @dp.shutdown()
 async def _on_shutdown():
     global _publish_task
-    # Дождаться обработки очереди и корректно завершить рабочего
     try:
         if _publish_task and not _publish_task.done():
             _publish_task.cancel()
@@ -664,9 +664,23 @@ async def _on_shutdown():
         except Exception:
             pass
 
-# ====== ЗАПУСК ======
+# ====== ЗАПУСК (auto-retry при Telegram Conflict) ======
 async def main():
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    while True:
+        try:
+            # На всякий случай снимем вебхук перед каждой попыткой
+            await bot.delete_webhook(drop_pending_updates=True)
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            # если polling завершился штатно — выходим из цикла
+            break
+        except Exception as e:
+            msg = str(e)
+            if "terminated by other getUpdates" in msg or "Conflict" in msg:
+                # короткая пауза и повтор
+                await asyncio.sleep(1.5)
+                continue
+            # любые другие ошибки — пробрасываем
+            raise
 
 if __name__ == "__main__":
     import asyncio
