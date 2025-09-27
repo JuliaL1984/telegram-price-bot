@@ -13,7 +13,6 @@ import math
 import json
 import asyncio
 import heapq
-import uuid, socket, platform  # NEW: диагностика инстанса
 from typing import Dict, Callable, Optional, List, Tuple, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -49,12 +48,6 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
-
-# ====== ДИАГНОСТИКА ИНСТАНСА ======
-START_UUID = str(uuid.uuid4())[:8]
-START_TS = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-HOST = socket.gethostname()
-RUNTIME = f"{platform.python_implementation()} {platform.python_version()}"
 
 # ====== ПАМЯТЬ ======
 # MediaItem: {"kind": "photo"|"video"|"text"|"forward", "fid": str, "mid": int, "cap": bool}
@@ -472,10 +465,10 @@ def extract_sizes_anywhere(text: str) -> str:
     def _expand(n1: str, n2: str):
         try:
             a = float(n1.replace(",", "."))
-            b = float(n2).replace(",", ".")  # type: ignore
+            b = float(n2.replace(",", "."))
         except Exception:
             a = float(n1.replace(",", "."))
-            b = float(n2).replace(",", "."))
+            b = float(n2.replace(",", "."))
         lo, hi = sorted((a, b))
         x = lo
         while x <= hi + 1e-9:
@@ -594,7 +587,7 @@ SIZES_BLOCK_RE = re.compile(r"Размеры:\s*(?P<body>.+?)(?:\n\s*\n|#|$)", r
 SIZE_ITEM_RE   = re.compile(r"\b(XXS|XS|S|M|L|XL|XXL|\d{2}(?:[.,]5)?)\b", re.I)
 
 def parse_sizes_block(text: str) -> str:
-    m = SIZES_BLOCK_RE.search(text или "")
+    m = SIZES_BLOCK_RE.search(text or "")
     if not m:
         return ""
     body = m.group("body")
@@ -612,19 +605,25 @@ def _is_price_line(l: str) -> bool:
 def pick_sizes_line(lines: List[str]) -> str:
     """
     Выбираем лучшую строку с размерами.
+    Приоритет 1: алфавитные размеры или перечисления/диапазоны.
+    Приоритет 2: одиночный числовой размер, НО не вплотную к строке с ценой.
     """
-    # Pass 1
+    # --- Pass 1: «сильные» кандидаты ---
     for line in lines:
         l = line.strip()
         if not l or _is_price_line(l):
             continue
+        # XS…XXL
         if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I):
             return l
+        # перечисления 39/40/41, 36,5/37, 1,2,3
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
             return l
+        # диапазоны 36-41, 6–10, 1-3
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}\s*[-–/]\s*{SIZE_NUM_ANY}(?!\d)", l):
             return l
-    # Pass 2
+
+    # --- Pass 2: одиночный размер, но не рядом с ценой ---
     for i, line in enumerate(lines):
         l = line.strip()
         if not l or _is_price_line(l):
@@ -635,6 +634,7 @@ def pick_sizes_line(lines: List[str]) -> str:
             if prev_is_price or next_is_price:
                 continue
             return l
+
     return ""
 
 def pick_season_line(lines: List[str]) -> str:
@@ -653,17 +653,22 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     text = cleanup_text_basic(raw_text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
+    # NEW: пробуем универсальный парсер (поддерживает 1360-20%)
     price_uni, discount_uni = parse_price_discount(text)
 
+    # Старые совместимые шаблоны (цена только с €)
     price_m    = re.search(r"(\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*€", text)
     discount_m = re.search(r"[–—\-−]\s*(\d{1,2})\s*%", text)
+    # Позволяем в retail как тысячи, так и десятичные копейки
     retail_m   = re.search(r"Retail\s*price\s*(\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)", text, flags=re.I)
 
+    # Итоговые значения
     price    = price_uni if price_uni is not None else (parse_number_token(price_m.group(1)) if price_m else None)
     discount = discount_uni if discount_uni is not None else (int(discount_m.group(1)) if discount_m else 0)
     retail   = parse_number_token(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
 
-    sizes_line  = parse_sizes_block(text) или pick_sizes_line(lines) или extract_sizes_anywhere(text)
+    # Важно: сначала пытаемся вытащить размеры из блока "Размеры:", иначе — эвристики
+    sizes_line  = parse_sizes_block(text) or pick_sizes_line(lines) or extract_sizes_anywhere(text)
     season_line = pick_season_line(lines)
 
     return {
@@ -682,6 +687,7 @@ def template_five_lines(final_price: int,
                         season_line: str,
                         brand_line: str) -> str:
     line1 = f"✅ <b>{ceil_price(final_price)}€</b>"
+    # Показываем retail только если он не меньше моей цены
     show_retail = bool(retail) and (ceil_price(final_price) <= ceil_price(retail))
     line2 = f"❌ <b>Retail price {ceil_price(retail)}€</b>" if show_retail else ""
     line3 = sizes_line or ""
@@ -707,8 +713,8 @@ def mk_mode(label: str,
 # ====== РЕЖИМЫ ======
 MODES: Dict[str, Dict] = {
     "sale": mk_mode("SALE"),
-    "lux": mk_mode("LUX", calc=lux_calc),
-    "luxocr": mk_mode("LUX OCR", calc=lux_calc),
+    "lux": mk_mode("LUX", calc=lux_calc),          # OCR off
+    "luxocr": mk_mode("LUX OCR", calc=lux_calc),   # OCR on
     "outlet": mk_mode("OUTLET"),
     "stock": mk_mode("STOCK"),
     "newfw": mk_mode("NEW FW"),
@@ -774,28 +780,6 @@ async def show_help(msg: Message):
 async def ping(msg: Message):
     await msg.answer("pong")
 
-# --- NEW: диагностика процесса ---
-@router.message(Command("who"))
-async def who(msg: Message):
-    await msg.answer(
-        f"Instance: <code>{START_UUID}</code>\n"
-        f"Host: <code>{HOST}</code>\n"
-        f"Started: <b>{START_TS}</b>\n"
-        f"Runtime: <code>{RUNTIME}</code>"
-    )
-
-@router.message(Command("diag"))
-async def diag(msg: Message):
-    info = await bot.get_webhook_info()
-    await msg.answer(
-        "Webhook:\n"
-        f"• url: <code>{info.url or ''}</code>\n"
-        f"• pending_update_count: <b>{getattr(info, 'pending_update_count', 0)}</b>\n"
-        f"• last_error_date: <code>{getattr(info, 'last_error_date', '')}</code>\n"
-        f"• last_error_message: <code>{getattr(info, 'last_error_message', '')}</code>\n"
-        f"\nInstance: <code>{START_UUID}</code>"
-    )
-
 # ====== СБОРКА ПОДПИСИ ======
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
     data = parse_input(caption)
@@ -829,6 +813,7 @@ async def handle_single_photo(msg: Message):
     item = {"kind": "photo", "fid": msg.photo[-1].file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
 
+    # Если есть ожидающая партия — прикрепляем и публикуем как пара
     if _attach_media_to_next_batch(msg.chat.id, [item], msg.from_user.id):
         return
 
@@ -904,6 +889,7 @@ async def handle_album_any(msg: Message):
 
         items.sort(key=lambda x: x["mid"])
 
+        # Если есть ожидающая партия и у альбома нет ценовой подписи — прикрепляем к партии
         if not caption:
             if _attach_media_to_next_batch(chat_id, items, user_id):
                 return
@@ -927,6 +913,7 @@ async def handle_album_any(msg: Message):
 @router.message(F.text)
 async def handle_text(msg: Message):
     txt = msg.text or ""
+    # NEW: распознаём цену без знака €
     has_price_token = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt, flags=re.I))
     has_discount    = bool(re.search(r"[–—\-−]?\s*\d{1,2}\s?%", txt))
     has_pair        = bool(PRICE_DISCOUNT_RE.search(txt))
@@ -1015,19 +1002,7 @@ async def handle_text(msg: Message):
 
 # ====== ЗАПУСК ======
 async def main():
-    # Жёсткая инициализация: webhook -> пусто (чтобы polling не конфликтовал)
-    try:
-        await bot.set_webhook(url="", drop_pending_updates=True, allowed_updates=[])
-        print("[BOOT] set_webhook('') ok")
-    except Exception as e:
-        print("[BOOT] set_webhook('') error:", repr(e))
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        print("[BOOT] delete_webhook ok")
-    except Exception as e:
-        print("[BOOT] delete_webhook error:", repr(e))
-
-    print(f"[BOOT] Instance {START_UUID} on host {HOST} starting polling...")
+    await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(publish_worker())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
