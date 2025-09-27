@@ -514,7 +514,6 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
         return None
     # оба разделителя присутствуют
     if "," in s and "." in s:
-        # Десятичный — тот, что справа
         if s.rfind(",") > s.rfind("."):
             dec, thou = ",", "."
         else:
@@ -524,22 +523,18 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
             return float(s)
         except ValueError:
             return None
-    # только запятые
     if "," in s and "." not in s:
-        # одиночная запятая и 1–2 цифры справа трактуем как десятичную
         if s.count(",") == 1 and re.search(r",\d{1,2}$", s):
             s = s.replace(",", ".")
             try:
                 return float(s)
             except ValueError:
                 return None
-        # иначе считаем разделителем тысяч
         s = s.replace(",", "")
         try:
             return float(s)
         except ValueError:
             return None
-    # только точки
     if "." in s and "," not in s:
         if s.count(".") == 1 and re.search(r"\.\d{1,2}$", s):
             try:
@@ -551,7 +546,6 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
             return float(s)
         except ValueError:
             return None
-    # только цифры
     try:
         return float(s)
     except ValueError:
@@ -613,16 +607,12 @@ def pick_sizes_line(lines: List[str]) -> str:
         l = line.strip()
         if not l or _is_price_line(l):
             continue
-        # XS…XXL
         if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I):
             return l
-        # перечисления 39/40/41, 36,5/37, 1,2,3
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
             return l
-        # диапазоны 36-41, 6–10, 1-3
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}\s*[-–/]\s*{SIZE_NUM_ANY}(?!\d)", l):
             return l
-
     # --- Pass 2: одиночный размер, но не рядом с ценой ---
     for i, line in enumerate(lines):
         l = line.strip()
@@ -634,7 +624,6 @@ def pick_sizes_line(lines: List[str]) -> str:
             if prev_is_price or next_is_price:
                 continue
             return l
-
     return ""
 
 def pick_season_line(lines: List[str]) -> str:
@@ -923,7 +912,7 @@ async def handle_text(msg: Message):
     is_forward = bool(getattr(msg, "forward_origin", None))
     chat_id = msg.chat.id
 
-    # 🔕 ГЛАВНОЕ: пересланные тексты без цены (включая эмодзи) — НЕ публикуем
+    # 🔕 Пересланные тексты без цены (включая эмодзи) — НЕ публикуем
     if not has_price and is_forward:
         return
 
