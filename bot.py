@@ -105,28 +105,33 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
         media.append(InputMediaVideo(media=it["fid"]) if it["kind"] == "video" else InputMediaPhoto(media=it["fid"]))
     await bot.send_media_group(TARGET_CHAT_ID, media)
 
+# ====== ПУБЛИКАЦИОННЫЙ ВОРКЕР (неубиваемый, не клинит очередь) ======
 async def publish_worker():
     global _next_to_publish
     while True:
-        # Забираем задачу из очереди
-        payload = await publish_queue.get()
         try:
-            seq = payload[0]
-            _pending[seq] = payload
+            # Забираем задачу из очереди
+            payload = await publish_queue.get()
+            try:
+                seq = payload[0]
+                _pending[seq] = payload
 
-            # Публикуем строго по seq
-            while _next_to_publish in _pending:
-                s, first_mid, user_id, items, caption, album_ocr_on = _pending.pop(_next_to_publish)
-                try:
-                    await _do_publish(user_id, items, caption, album_ocr_on)
-                except Exception:
-                    # Не даём очереди «залипнуть» на одном посте
-                    pass
-                finally:
-                    _next_to_publish += 1
-        finally:
-            # FIX: task_done только когда мы реально обработали «батч»
-            publish_queue.task_done()
+                # Публикуем строго по порядку seq
+                while _next_to_publish in _pending:
+                    s, first_mid, user_id, items, caption, album_ocr_on = _pending.pop(_next_to_publish)
+                    try:
+                        await _do_publish(user_id, items, caption, album_ocr_on)
+                    except Exception:
+                        # Не даём очереди «залипнуть» на одном посте
+                        pass
+                    finally:
+                        _next_to_publish += 1
+            finally:
+                # task_done только когда реально обработали «батч»
+                publish_queue.task_done()
+        except Exception:
+            # Любая неожиданная ошибка — короткая пауза и продолжаем работать
+            await asyncio.sleep(0.2)
 
 async def publish_to_target(seq: int, first_mid: int, user_id: int, items: List[Dict[str, Any]], caption: str):
     album_ocr_on = is_ocr_enabled_for(user_id)
@@ -445,7 +450,7 @@ MODES: Dict[str, Dict] = {
     "flash": mk_mode("FLASH"),
     "bundle": mk_mode("BUNDLE"),
     "limited": mk_mode("LIMITED"),
-    "m1": mk_mode("M1"), "m2": mk_mode("M2"), "m3": mk_mode("M3"), "m4": mk_mode("М4"), "m5": mk_mode("M5"),
+    "m1": mk_mode("M1"), "m2": mk_mode("M2"), "m3": mk_mode("М3"), "m4": mk_mode("М4"), "m5": mk_mode("M5"),
 }
 
 def is_admin(user_id: int) -> bool:
@@ -674,7 +679,7 @@ async def handle_text(msg: Message):
 
     return
 
-# ====== ЗАПУСК (Render-friendly polling с graceful shutdown) ======
+# ====== ЗАПУСК (Render-friendly, устойчивый) ======
 async def main():
     # Снимаем возможный вебхук и чистим подвисшие апдейты перед polling
     await bot.delete_webhook(drop_pending_updates=True)
@@ -684,21 +689,5 @@ async def main():
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-
-    # Корректное завершение при деплое на Render
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, loop.stop)
-        except NotImplementedError:
-            pass
-
-    try:
-        loop.run_until_complete(main())
-    finally:
-        # Закрываем HTTP-сессию Telegram-клиента
-        try:
-            loop.run_until_complete(bot.session.close())
-        except Exception:
-            pass
-        loop.close()
+    # Без ручных loop/сигналов — устойчивее на Render
+    asyncio.run(main())
