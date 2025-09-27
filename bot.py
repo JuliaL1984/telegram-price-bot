@@ -31,8 +31,10 @@ ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
 # Базовая политика: в альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
-FILTER_PRICETAGS_IN_ALБУМС = os.getenv("FILTER_PRICETAGS_IN_ALБУМС")
-FILTER_PRICETAGS_IN_ALBUMS = (FILTER_PRICETAGS_IN_ALБУМС == "1") if FILTER_PRICЕТAGЅ_IN_ALБУМС is not None else (os.getenv("FILTER_PRICETAGS_IN_ALBUMS","1")=="1")
+# >>> исправлено: нормальные латинские буквы, без опечаток
+_env_flag = os.getenv("FILTER_PRICETAGS_IN_ALBUMS")
+FILTER_PRICETAGS_IN_ALBUMS = (_env_flag == "1") if _env_flag is not None else True
+# <<<
 
 # ====== ИНИЦИАЛИЗАЦИЯ ======
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
