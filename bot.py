@@ -11,7 +11,7 @@ import re
 import io
 import math
 import asyncio
-import signal  # <<< добавлено
+import signal  # оставляю как у тебя
 from typing import Dict, Callable, Optional, List, Tuple, Any
 from datetime import datetime, timedelta
 
@@ -20,6 +20,9 @@ from aiogram.types import Message, InputMediaPhoto, InputMediaVideo
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
+# >>> добавлено: устойчивость к конфликтам polling
+from aiogram.exceptions import TelegramConflictError, TelegramRetryAfter
+# <<<
 
 # ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -110,7 +113,6 @@ async def publish_worker():
     global _next_to_publish
     while True:
         try:
-            # Забираем задачу из очереди
             payload = await publish_queue.get()
             try:
                 seq = payload[0]
@@ -127,7 +129,6 @@ async def publish_worker():
                     finally:
                         _next_to_publish += 1
             finally:
-                # task_done только когда реально обработали «батч»
                 publish_queue.task_done()
         except Exception:
             # Любая неожиданная ошибка — короткая пауза и продолжаем работать
@@ -679,15 +680,53 @@ async def handle_text(msg: Message):
 
     return
 
-# ====== ЗАПУСК (Render-friendly, устойчивый) ======
+# ====== ЗАПУСК (Render-friendly polling с graceful retry при конфликтах) ======
 async def main():
-    # Снимаем возможный вебхук и чистим подвисшие апдейты перед polling
+    # Снимаем возможный вебхук и чистим подвисшие апдейты перед polling (один раз)
     await bot.delete_webhook(drop_pending_updates=True)
-    # Запускаем фонового публикационного работника
+
+    # Стартуем фонового публикационного работника (один раз)
     asyncio.create_task(publish_worker())
-    # Стартуем polling ровно один раз
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+    # Устойчивый цикл перезапуска polling при TelegramConflictError / RetryAfter
+    backoff = 1.0
+    while True:
+        try:
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            # Если polling корректно завершился (редко) — выходим
+            break
+        except TelegramConflictError:
+            # Второй инстанс забрал getUpdates — подождём и пробуем снова
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 10.0)
+            continue
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(float(getattr(e, "retry_after", 2)) + 0.5)
+            continue
+        except asyncio.CancelledError:
+            # Корректное завершение (деплой/остановка)
+            break
+        except Exception:
+            # Любая другая ошибка — короткий сон и повтор
+            await asyncio.sleep(2.0)
+            continue
 
 if __name__ == "__main__":
-    # Без ручных loop/сигналов — устойчивее на Render
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+
+    # Корректное завершение при деплое на Render
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, loop.stop)
+        except NotImplementedError:
+            pass
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        # Закрываем HTTP-сессию Telegram-клиента
+        try:
+            loop.run_until_complete(bot.session.close())
+        except Exception:
+            pass
+        loop.close()
