@@ -1,15 +1,18 @@
 FROM python:3.11-slim
 
-# Системные зависимости для Tesseract
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr tesseract-ocr-ita \
- && rm -rf /var/lib/apt/lists/*
-
-ENV PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+# базовые настройки Python
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    OCR_ENABLED=0
 
 WORKDIR /app
-COPY requirements.txt ./requirements.txt
+
+# сначала зависимости — для кэширования слоёв
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# затем код
 COPY . .
-CMD ["python", "bot.py"]
+
+# команда запуска для Render (Background Worker)
+CMD ["python", "-u", "bot.py"]
