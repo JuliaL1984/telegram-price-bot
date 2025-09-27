@@ -13,6 +13,7 @@ import math
 import json
 import asyncio
 import heapq
+import uuid, socket, platform  # NEW: диагностика инстанса
 from typing import Dict, Callable, Optional, List, Tuple, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -48,6 +49,12 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+
+# ====== ДИАГНОСТИКА ИНСТАНСА ======
+START_UUID = str(uuid.uuid4())[:8]
+START_TS = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+HOST = socket.gethostname()
+RUNTIME = f"{platform.python_implementation()} {platform.python_version()}"
 
 # ====== ПАМЯТЬ ======
 # MediaItem: {"kind": "photo"|"video"|"text"|"forward", "fid": str, "mid": int, "cap": bool}
@@ -465,10 +472,10 @@ def extract_sizes_anywhere(text: str) -> str:
     def _expand(n1: str, n2: str):
         try:
             a = float(n1.replace(",", "."))
-            b = float(n2.replace(",", "."))
+            b = float(n2).replace(",", ".")  # type: ignore
         except Exception:
             a = float(n1.replace(",", "."))
-            b = float(n2.replace(",", "."))
+            b = float(n2).replace(",", "."))
         lo, hi = sorted((a, b))
         x = lo
         while x <= hi + 1e-9:
@@ -514,6 +521,7 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
         return None
     # оба разделителя присутствуют
     if "," in s and "." in s:
+        # Десятичный — тот, что справа
         if s.rfind(",") > s.rfind("."):
             dec, thou = ",", "."
         else:
@@ -523,18 +531,22 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
             return float(s)
         except ValueError:
             return None
+    # только запятые
     if "," in s and "." not in s:
+        # одиночная запятая и 1–2 цифры справа трактуем как десятичную
         if s.count(",") == 1 and re.search(r",\d{1,2}$", s):
             s = s.replace(",", ".")
             try:
                 return float(s)
             except ValueError:
                 return None
+        # иначе считаем разделителем тысяч
         s = s.replace(",", "")
         try:
             return float(s)
         except ValueError:
             return None
+    # только точки
     if "." in s and "," not in s:
         if s.count(".") == 1 and re.search(r"\.\d{1,2}$", s):
             try:
@@ -546,6 +558,7 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
             return float(s)
         except ValueError:
             return None
+    # только цифры
     try:
         return float(s)
     except ValueError:
@@ -581,7 +594,7 @@ SIZES_BLOCK_RE = re.compile(r"Размеры:\s*(?P<body>.+?)(?:\n\s*\n|#|$)", r
 SIZE_ITEM_RE   = re.compile(r"\b(XXS|XS|S|M|L|XL|XXL|\d{2}(?:[.,]5)?)\b", re.I)
 
 def parse_sizes_block(text: str) -> str:
-    m = SIZES_BLOCK_RE.search(text or "")
+    m = SIZES_BLOCK_RE.search(text или "")
     if not m:
         return ""
     body = m.group("body")
@@ -597,7 +610,10 @@ def _is_price_line(l: str) -> bool:
     return bool(re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I))
 
 def pick_sizes_line(lines: List[str]) -> str:
-    # (без изменений)
+    """
+    Выбираем лучшую строку с размерами.
+    """
+    # Pass 1
     for line in lines:
         l = line.strip()
         if not l or _is_price_line(l):
@@ -608,6 +624,7 @@ def pick_sizes_line(lines: List[str]) -> str:
             return l
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}\s*[-–/]\s*{SIZE_NUM_ANY}(?!\d)", l):
             return l
+    # Pass 2
     for i, line in enumerate(lines):
         l = line.strip()
         if not l or _is_price_line(l):
@@ -637,6 +654,7 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     price_uni, discount_uni = parse_price_discount(text)
+
     price_m    = re.search(r"(\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*€", text)
     discount_m = re.search(r"[–—\-−]\s*(\d{1,2})\s*%", text)
     retail_m   = re.search(r"Retail\s*price\s*(\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)", text, flags=re.I)
@@ -645,7 +663,7 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     discount = discount_uni if discount_uni is not None else (int(discount_m.group(1)) if discount_m else 0)
     retail   = parse_number_token(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
 
-    sizes_line  = parse_sizes_block(text) or pick_sizes_line(lines) or extract_sizes_anywhere(text)
+    sizes_line  = parse_sizes_block(text) или pick_sizes_line(lines) или extract_sizes_anywhere(text)
     season_line = pick_season_line(lines)
 
     return {
@@ -755,6 +773,28 @@ async def show_help(msg: Message):
 @router.message(Command("ping"))
 async def ping(msg: Message):
     await msg.answer("pong")
+
+# --- NEW: диагностика процесса ---
+@router.message(Command("who"))
+async def who(msg: Message):
+    await msg.answer(
+        f"Instance: <code>{START_UUID}</code>\n"
+        f"Host: <code>{HOST}</code>\n"
+        f"Started: <b>{START_TS}</b>\n"
+        f"Runtime: <code>{RUNTIME}</code>"
+    )
+
+@router.message(Command("diag"))
+async def diag(msg: Message):
+    info = await bot.get_webhook_info()
+    await msg.answer(
+        "Webhook:\n"
+        f"• url: <code>{info.url or ''}</code>\n"
+        f"• pending_update_count: <b>{getattr(info, 'pending_update_count', 0)}</b>\n"
+        f"• last_error_date: <code>{getattr(info, 'last_error_date', '')}</code>\n"
+        f"• last_error_message: <code>{getattr(info, 'last_error_message', '')}</code>\n"
+        f"\nInstance: <code>{START_UUID}</code>"
+    )
 
 # ====== СБОРКА ПОДПИСИ ======
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
@@ -908,7 +948,7 @@ async def handle_text(msg: Message):
         _arm_batch_timer(chat_id, rec)
         return
 
-    # Привязка к одиночным медиа, отправленным ранее
+    # Привязка к одиночным медиа, отправленным ранее (окно ALBUM_WINDOW_SECONDS)
     bucket = last_media.get(chat_id)
     if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
         user_id = bucket.get("user_id") or msg.from_user.id
@@ -932,7 +972,7 @@ async def handle_text(msg: Message):
         del last_media[chat_id]
         return
 
-    # Привязка текста к самому свежему альбому этого чата
+    # Привязка текста к самому свежему альбому этого чата (если ещё «дышит»)
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
@@ -975,7 +1015,19 @@ async def handle_text(msg: Message):
 
 # ====== ЗАПУСК ======
 async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
+    # Жёсткая инициализация: webhook -> пусто (чтобы polling не конфликтовал)
+    try:
+        await bot.set_webhook(url="", drop_pending_updates=True, allowed_updates=[])
+        print("[BOOT] set_webhook('') ok")
+    except Exception as e:
+        print("[BOOT] set_webhook('') error:", repr(e))
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        print("[BOOT] delete_webhook ok")
+    except Exception as e:
+        print("[BOOT] delete_webhook error:", repr(e))
+
+    print(f"[BOOT] Instance {START_UUID} on host {HOST} starting polling...")
     asyncio.create_task(publish_worker())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
