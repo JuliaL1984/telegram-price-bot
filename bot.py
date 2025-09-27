@@ -19,6 +19,7 @@ from aiogram.types import Message, InputMediaPhoto, InputMediaVideo
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramConflictError  # <<< ДОБАВЛЕНО: ловим конфликт polling
 
 # ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -118,6 +119,7 @@ async def publish_worker():
                 try:
                     await _do_publish(user_id, items, caption, album_ocr_on)
                 except Exception:
+                    # не блокируем очередь на ошибке
                     pass
                 finally:
                     _next_to_publish += 1
@@ -644,9 +646,8 @@ async def _on_startup():
     global _publish_task
     # Снимаем вебхук, чтобы гарантированно уйти в polling и отрезать чужие сеансы
     await bot.delete_webhook(drop_pending_updates=True)
-    # Запускаем рабочего — ТОЛЬКО если еще не запущен
-    if _publish_task is None or _publish_task.done():
-        _publish_task = asyncio.create_task(publish_worker())
+    # Запускаем рабочего
+    _publish_task = asyncio.create_task(publish_worker())
 
 @dp.shutdown()
 async def _on_shutdown():
@@ -664,23 +665,20 @@ async def _on_shutdown():
         except Exception:
             pass
 
-# ====== ЗАПУСК (auto-retry при Telegram Conflict) ======
+# ====== ЗАПУСК ======
 async def main():
+    # Цикл, который сам пережидает TelegramConflictError и перезапускает polling
+    attempt = 0
     while True:
         try:
-            # На всякий случай снимем вебхук перед каждой попыткой
-            await bot.delete_webhook(drop_pending_updates=True)
+            attempt += 1
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-            # если polling завершился штатно — выходим из цикла
-            break
-        except Exception as e:
-            msg = str(e)
-            if "terminated by other getUpdates" in msg or "Conflict" in msg:
-                # короткая пауза и повтор
-                await asyncio.sleep(1.5)
-                continue
-            # любые другие ошибки — пробрасываем
-            raise
+            break  # обычное завершение
+        except TelegramConflictError:
+            # другой процесс ещё держит getUpdates — ждём и пробуем снова
+            wait = min(5 + attempt * 0.5, 15)  # мягкий backoff
+            await asyncio.sleep(wait)
+            continue
 
 if __name__ == "__main__":
     import asyncio
