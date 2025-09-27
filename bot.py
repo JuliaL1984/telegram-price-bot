@@ -19,23 +19,19 @@ from aiogram.types import Message, InputMediaPhoto, InputMediaVideo
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramConflictError  # <<< ДОБАВЛЕНО: ловим конфликт polling
 
 # ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002973176038"))
 ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "1500"))  # стабильнее собирает альбомы
+ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "1500"))
 ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
 
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
-# Базовая политика: в альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
-# >>> исправлено: нормальные латинские буквы, без опечаток
 _env_flag = os.getenv("FILTER_PRICETAGS_IN_ALBUMS")
 FILTER_PRICETAGS_IN_ALBUMS = (_env_flag == "1") if _env_flag is not None else True
-# <<<
 
 # ====== ИНИЦИАЛИЗАЦИЯ ======
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -44,59 +40,74 @@ router = Router()
 dp.include_router(router)
 
 # ====== ПАМЯТЬ ======
-# MediaItem: {"kind": "photo"|"video", "fid": str, "mid": int, "cap": bool}
 last_media: Dict[int, Dict[str, Any]] = {}
 active_mode: Dict[int, str] = {}
 album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
-# ====== STRICT GLOBAL SEQ (без обгонов между постами) ======
+# ====== STRICT GLOBAL SEQ ======
 _next_seq = 0
 _next_to_publish = 1
-_pending: Dict[int, Tuple[int, int, int, List[Dict[str, Any]], str, bool]] = {}  # seq -> payload
+_pending: Dict[int, Tuple[int, int, int, List[Dict[str, Any]], str, bool]] = {}
 
 def alloc_seq() -> int:
     global _next_seq
     _next_seq += 1
     return _next_seq
 
-# Очередь событий (не приоритетная)
 publish_queue: "asyncio.Queue[Tuple[int, int, int, List[Dict[str, Any]], str, bool]]" = asyncio.Queue()
 
 def is_ocr_enabled_for(user_id: int) -> bool:
-    """
-    /lux      -> OCR off для альбомов
-    /luxocr   -> OCR on  для альбомов
-    остальные режимы -> глобальная FILTER_PRICETAGS_IN_ALBUMS
-    """
-    mode = active_mode.get(user_id, "lux")  # <<< default LUX
+    mode = active_mode.get(user_id, "lux")
     if mode == "lux":
         return False
     if mode == "luxocr":
         return True
     return FILTER_PRICETAGS_IN_ALBUMS
 
+# ---------- МАЛЕНЬКИЙ РЕТРАЙ-ХЕЛПЕР ----------
+async def _tg_call(call, *args, **kwargs):
+    """
+    Выполняет Telegram API вызов с мягким ретраем:
+    FloodWait/временные сетевые — ещё одна попытка.
+    Все ошибки пишем в лог, чтобы видеть причину «молчания».
+    """
+    try:
+        return await call(*args, **kwargs)
+    except Exception as e:
+        # Логируем ПЕРВУЮ ошибку
+        print(f"[publish] API error: {type(e).__name__}: {e}")
+        # Пробуем короткую задержку и вторую попытку только на временные сбои
+        text = str(e).lower()
+        if any(k in text for k in ("flood", "retry later", "temporarily", "timeout", "bad gateway", "conflict")):
+            try:
+                await asyncio.sleep(2)
+                return await call(*args, **kwargs)
+            except Exception as e2:
+                print(f"[publish] retry failed: {type(e2).__name__}: {e2}")
+                raise
+        raise
+
 async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, album_ocr_on: bool):
-    """Реальная отправка сообщений (фото/видео/альбомы/текст)."""
     if not items:
         return
 
-    # текстовый пост «как есть»
+    # текстовый пост
     if items and items[0].get("kind") == "text":
-        await bot.send_message(TARGET_CHAT_ID, caption or "")
+        await _tg_call(bot.send_message, TARGET_CHAT_ID, caption or "")
         return
 
-    # OCR-фильтрация только для альбомов при album_ocr_on=True
+    # OCR-фильтрация только для альбомов
     items = await filter_pricetag_media(items, album_ocr_on)
 
     if len(items) == 1:
         it = items[0]
         if it["kind"] == "video":
-            await bot.send_video(TARGET_CHAT_ID, it["fid"], caption=caption)
+            await _tg_call(bot.send_video, TARGET_CHAT_ID, it["fid"], caption=caption)
         else:
-            await bot.send_photo(TARGET_CHAT_ID, it["fid"], caption=caption)
+            await _tg_call(bot.send_photo, TARGET_CHAT_ID, it["fid"], caption=caption)
         return
 
-    # Альбом: подпись к первому
+    # Альбом
     first = items[0]
     media = []
     if first["kind"] == "video":
@@ -105,7 +116,9 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
         media.append(InputMediaPhoto(media=first["fid"], caption=caption, parse_mode=ParseMode.HTML))
     for it in items[1:]:
         media.append(InputMediaVideo(media=it["fid"]) if it["kind"] == "video" else InputMediaPhoto(media=it["fid"]))
-    await bot.send_media_group(TARGET_CHAT_ID, media)
+
+    # важное: не глотаем исключение, печатаем в лог и пробуем мягкий ретрай
+    await _tg_call(bot.send_media_group, TARGET_CHAT_ID, media)
 
 async def publish_worker():
     global _next_to_publish
@@ -118,9 +131,9 @@ async def publish_worker():
                 s, first_mid, user_id, items, caption, album_ocr_on = _pending.pop(_next_to_publish)
                 try:
                     await _do_publish(user_id, items, caption, album_ocr_on)
-                except Exception:
-                    # не блокируем очередь на ошибке
-                    pass
+                except Exception as e:
+                    # НЕ ГЛОТАЕМ ТИХО — печатаем разборчиво
+                    print(f"[publish] failed for seq={s}, first_mid={first_mid}: {type(e).__name__}: {e}")
                 finally:
                     _next_to_publish += 1
         finally:
@@ -157,7 +170,8 @@ async def ocr_should_hide(file_id: str) -> bool:
         has_price_token = bool(re.search(_price_token_regex(), txt))
         has_kw = ("retail" in tl) or ("price" in tl) or ("prezzo" in tl) or ("%" in txt)
         return bool(has_price_token and has_kw)
-    except Exception:
+    except Exception as e:
+        print(f"[ocr] skip (error {type(e).__name__}: {e})")
         return False
 
 async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool) -> List[Dict[str, Any]]:
@@ -172,10 +186,10 @@ async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool)
             kept.append(it)
     return kept if kept else items[:1]
 
-# ====== КАЛЬКУЛЯТОРЫ ======
+# ====== КАЛЬКУЛЯТОРЫ / РАЗБОР / ШАБЛОНЫ ======
+import math
 def ceil_price(value: float) -> int:
     return int(math.ceil(value - 1e-9))
-
 def default_calc(price: float, discount: int) -> int:
     discounted = price * (1 - discount / 100)
     if discounted <= 250:
@@ -184,7 +198,6 @@ def default_calc(price: float, discount: int) -> int:
         return ceil_price(discounted + 70)
     else:
         return ceil_price(discounted + 90)
-
 def lux_calc(price: float, discount: int) -> int:
     discounted = price * (1 - discount / 100)
     if discounted <= 250:
@@ -195,7 +208,6 @@ def lux_calc(price: float, discount: int) -> int:
         final = discounted * 1.10 + 30
     return ceil_price(final)
 
-# ====== РАЗБОР И 5-СТРОЧНАЯ ПОДПИСЬ ======
 def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"#\S+", "", text)
     text = re.sub(r"[ \t]+", " ", text)
@@ -210,7 +222,6 @@ SIZE_TOKEN   = rf"(?:{SIZE_ALPHA}|{SIZE_NUM_ANY})"
 
 def _strip_seasons_for_size_scan(text: str) -> str:
     return re.sub(r"\b(?:NEW\s+)?(?:FW|SS)\d+(?:/\d+)?\b", " ", text, flags=re.I)
-
 def _strip_discounts_and_prices(text: str) -> str:
     text = re.sub(r"[-−–—]?\s?\d{1,3}\s?%", " ", text)
     text = re.sub(_price_token_regex(), " ", text)
@@ -223,21 +234,16 @@ def extract_sizes_anywhere(text: str) -> str:
     ranges_slash = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})\s*/\s*({SIZE_NUM_ANY})(?!\d)", work)
     singles_num   = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})(?!\d)", work)
     singles_alpha = re.findall(rf"\b({SIZE_ALPHA})\b", work, flags=re.I)
-
     parts: List[str] = []
     used = set()
-
     def add(tok: str):
         tok = tok.replace(".5", ",5")
         if tok not in used:
             parts.append(tok); used.add(tok)
-
     for a, b in (ranges_dash + ranges_slash):
         add(f"{a.replace('.5', ',5')}-{b.replace('.5', ',5')}")
-
     for t in singles_alpha:
         add(t.upper())
-
     covered_nums = set()
     def _expand(n1: str, n2: str):
         try:
@@ -253,18 +259,15 @@ def extract_sizes_anywhere(text: str) -> str:
             pass
     for a, b in (ranges_dash + ranges_slash):
         _expand(a, b)
-
     for t in singles_num:
         norm = t.replace(".5", ",5")
         if norm in covered_nums:
             continue
         add(norm)
-
     evidence_of_ranges = bool(ranges_dash or ranges_slash)
     has_alpha = bool(singles_alpha)
     if not evidence_of_ranges and not has_alpha and len([p for p in parts if re.fullmatch(r"\d+(?:,\d)?", p)]) == 1:
         return ""
-
     return ", ".join(parts)
 
 def pick_sizes_line(lines: List[str]) -> str:
@@ -278,7 +281,6 @@ def pick_sizes_line(lines: List[str]) -> str:
            re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
             return l
     return ""
-
 def pick_season_line(lines: List[str]) -> str:
     for line in lines:
         if re.search(r"\bNEW\s+(?:FW|SS)\d+(?:/\d+)?\b", line, flags=re.I):
@@ -288,32 +290,21 @@ def pick_season_line(lines: List[str]) -> str:
             return line.strip()
     return ""
 
-MATERIAL_KEYWORDS = [
-    "silk","wool","cotton","cashmere","linen","leather","suede","denim","canvas",
-    "viscose","rayon","polyester","nylon","polyamide","acrylic","acetate","elastane","spandex",
-    "mohair","alpaca","angora","down","feather","goose down","merino","rubber","lyocell","tencel"
-]
-
 MATERIAL_RE = re.compile(
     r"(?:(\d{1,3})\s*%\s*)?(?:"
     r"(silk|wool|cotton|cashmere|linen|leather|suede|denim|canvas|viscose|rayon|polyester|nylon|polyamide|acrylic|acetate|elastane|spandex|mohair|alpaca|angora|down|feather|goose\s+down|merino|rubber|lyocell|tencel)"
     r")",
     flags=re.I
 )
-
 def extract_materials_line(text: str) -> str:
     parts: List[str] = []
     used = set()
     for m in MATERIAL_RE.finditer(text):
         pct, mat = m.group(1), m.group(2)
         mat_clean = re.sub(r"\s+", " ", mat.strip()).lower()
-        if pct:
-            token = f"{pct}% {mat_clean}"
-        else:
-            token = mat_clean
+        token = f"{pct}% {mat_clean}" if pct else mat_clean
         if token not in used:
-            parts.append(token)
-            used.add(token)
+            parts.append(token); used.add(token)
     return ", ".join(parts)
 
 def parse_number_token(token: Optional[str]) -> Optional[float]:
@@ -324,19 +315,15 @@ def parse_number_token(token: Optional[str]) -> Optional[float]:
 def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     text = cleanup_text_basic(raw_text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-
     price_m    = re.search(r"(\d+(?:[.,]\d{3})*)\s*€", text)
     discount_m = re.search(r"[-−–—]\s*(\d{1,2})\s*%(?=\D|$)", text)
     retail_m   = re.search(r"Retail\s*price\s*(\d+(?:[.,]\d{3})*)", text, flags=re.I)
-
     price    = parse_number_token(price_m.group(1)) if price_m else None
     discount = int(discount_m.group(1)) if discount_m else 0
     retail   = parse_number_token(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
-
     sizes_line     = pick_sizes_line(lines) or extract_sizes_anywhere(text)
     season_line    = pick_season_line(lines)
     materials_line = extract_materials_line(text)
-
     return {
         "price": price,
         "discount": discount,
@@ -378,7 +365,6 @@ def mk_mode(label: str,
             template: Callable[[int, float, str, str, str], str] = template_five_lines):
     return {"label": label, "calc": calc, "template": template}
 
-# ====== РЕЖИМЫ ======
 MODES: Dict[str, Dict] = {
     "lux": mk_mode("LUX", calc=lux_calc),
     "luxocr": mk_mode("LUX OCR", calc=lux_calc),
@@ -644,9 +630,7 @@ _publish_task: Optional[asyncio.Task] = None
 @dp.startup()
 async def _on_startup():
     global _publish_task
-    # Снимаем вебхук, чтобы гарантированно уйти в polling и отрезать чужие сеансы
     await bot.delete_webhook(drop_pending_updates=True)
-    # Запускаем рабочего
     _publish_task = asyncio.create_task(publish_worker())
 
 @dp.shutdown()
@@ -667,18 +651,7 @@ async def _on_shutdown():
 
 # ====== ЗАПУСК ======
 async def main():
-    # Цикл, который сам пережидает TelegramConflictError и перезапускает polling
-    attempt = 0
-    while True:
-        try:
-            attempt += 1
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-            break  # обычное завершение
-        except TelegramConflictError:
-            # другой процесс ещё держит getUpdates — ждём и пробуем снова
-            wait = min(5 + attempt * 0.5, 15)  # мягкий backoff
-            await asyncio.sleep(wait)
-            continue
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
     import asyncio
