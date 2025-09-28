@@ -354,13 +354,15 @@ def ceil_price(value: float) -> int:
     return int(math.ceil(value - 1e-9))
 
 def default_calc(price: float, discount: int) -> int:
+    """Единая формула: ≤250 +55; ≤400 +70; >400 → +10% и +30 (округление вверх)."""
     discounted = price * (1 - discount / 100)
     if discounted <= 250:
         return ceil_price(discounted + 55)
     elif discounted <= 400:
         return ceil_price(discounted + 70)
     else:
-        return ceil_price(discounted + 90)
+        # ИСПРАВЛЕНО: было +90, теперь как в lux: +10% и +30
+        return ceil_price(discounted * 1.10 + 30)
 
 def lux_calc(price: float, discount: int) -> int:
     discounted = price * (1 - discount / 100)
@@ -635,8 +637,6 @@ def _split_by_price_lines(caption: str) -> List[str]:
         cur.append(r)
         if _is_price_line(r):
             saw_price_in_cur = True
-            # если следующая строка тоже ценовая — закроем блок на переходе
-    # финальный сброс
     flush()
     return ["\n".join(b).strip() for b in blocks if b]
 
@@ -679,7 +679,7 @@ def build_result_text_multi(user_id: int, caption: str) -> Optional[str]:
     if not blocks:
         return None
     chunks = [build_result_text_for_block(user_id, b) for b in blocks]
-    # один пустой ряд между позициями
+    # ОДНА строка между позициями (не две)
     return ("\n".join(chunks)).strip()
 
 # ====== КОМАНДЫ ======
