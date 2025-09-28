@@ -465,10 +465,10 @@ def extract_sizes_anywhere(text: str) -> str:
     def _expand(n1: str, n2: str):
         try:
             a = float(n1.replace(",", "."))
-            b = float(n2.replace(",", "."))
+            b = float(n2).replace(",", ".")  # type: ignore
         except Exception:
             a = float(n1.replace(",", "."))
-            b = float(n2.replace(",", "."))
+            b = float(n2).replace(",", "."))
         lo, hi = sorted((a, b))
         x = lo
         while x <= hi + 1e-9:
@@ -514,6 +514,7 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
         return None
     # оба разделителя присутствуют
     if "," in s and "." in s:
+        # Десятичный — тот, что справа
         if s.rfind(",") > s.rfind("."):
             dec, thou = ",", "."
         else:
@@ -523,18 +524,22 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
             return float(s)
         except ValueError:
             return None
+    # только запятые
     if "," in s and "." not in s:
+        # одиночная запятая и 1–2 цифры справа трактуем как десятичную
         if s.count(",") == 1 and re.search(r",\d{1,2}$", s):
             s = s.replace(",", ".")
             try:
                 return float(s)
             except ValueError:
                 return None
+        # иначе считаем разделителем тысяч
         s = s.replace(",", "")
         try:
             return float(s)
         except ValueError:
             return None
+    # только точки
     if "." in s and "," not in s:
         if s.count(".") == 1 and re.search(r"\.\d{1,2}$", s):
             try:
@@ -546,6 +551,7 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
             return float(s)
         except ValueError:
             return None
+    # только цифры
     try:
         return float(s)
     except ValueError:
@@ -602,17 +608,22 @@ def pick_sizes_line(lines: List[str]) -> str:
     Приоритет 1: алфавитные размеры или перечисления/диапазоны.
     Приоритет 2: одиночный числовой размер, НО не вплотную к строке с ценой.
     """
+
     # --- Pass 1: «сильные» кандидаты ---
     for line in lines:
         l = line.strip()
         if not l or _is_price_line(l):
             continue
+        # XS…XXL
         if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I):
             return l
+        # перечисления 39/40/41, 36,5/37, 1,2,3
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
             return l
+        # диапазоны 36-41, 6–10, 1-3
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}\s*[-–/]\s*{SIZE_NUM_ANY}(?!\d)", l):
             return l
+
     # --- Pass 2: одиночный размер, но не рядом с ценой ---
     for i, line in enumerate(lines):
         l = line.strip()
@@ -624,6 +635,7 @@ def pick_sizes_line(lines: List[str]) -> str:
             if prev_is_price or next_is_price:
                 continue
             return l
+
     return ""
 
 def pick_season_line(lines: List[str]) -> str:
@@ -637,6 +649,13 @@ def pick_season_line(lines: List[str]) -> str:
 
 def parse_number_token(token: Optional[str]) -> Optional[float]:
     return parse_money_token(token)
+
+# ========= МУЛЬТИ-ПОЗИЦИИ =========
+POS_SPLIT_RE = re.compile(r"\n\s*\n+")  # делим по пустым строкам (абзацы)
+PRICE_TOKEN_OR_PAIR_RE = re.compile(
+    rf"(?:{PRICE_DISCOUNT_RE.pattern})|(?:\d{{2,6}}(?:[.,]\d{{3}})*(?:[.,]\d{{1,2}})?\s*(?:€|eur|euro))",
+    re.IGNORECASE | re.VERBOSE | re.S,
+)
 
 def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     text = cleanup_text_basic(raw_text)
@@ -737,6 +756,50 @@ MODES: Dict[str, Dict] = {
 def is_admin(user_id: int) -> bool:
     return (not ADMINS) or (user_id in ADMINS)
 
+# ====== ХЕЛПЕРЫ ДЛЯ МУЛЬТИ-ПОЗИЦИЙ ======
+def _split_positions(caption: str) -> List[str]:
+    """
+    Делим подпись на абзацы по пустым строкам.
+    Возвращаем только те куски, где есть явная цена/скидка или €.
+    """
+    blocks = [b.strip() for b in POS_SPLIT_RE.split(caption.strip()) if b.strip()]
+    if len(blocks) <= 1:
+        return []
+    good = [b for b in blocks if PRICE_TOKEN_OR_PAIR_RE.search(b)]
+    # если после фильтра осталось <2, считаем, что это не мульти-кейс
+    return good if len(good) >= 2 else []
+
+def build_result_text_for_block(user_id: int, text_block: str) -> str:
+    data = parse_input(text_block)
+    price = data.get("price")
+    mode = MODES.get(active_mode.get(user_id, "sale"), MODES["sale"])
+    calc_fn, tpl_fn = mode["calc"], mode["template"]
+    if price is None:
+        # мягкий фолбэк — показываем размеры/сезон и подсказку по цене
+        hint = "⚠️ Не нашла цену. Пример: 650€ -35% или 1360-20%"
+        sizes = (data.get("sizes_line") or "").strip()
+        season = (data.get("season_line") or "").strip()
+        parts = [hint]
+        if sizes: parts.append(sizes)
+        if season: parts.append(season)
+        return "\n".join(parts)
+    final_price = calc_fn(float(price), int(data.get("discount", 0)))
+    return tpl_fn(
+        final_price=final_price,
+        retail=float(data.get("retail", 0.0) or 0.0),
+        sizes_line=data.get("sizes_line", "") or "",
+        season_line=data.get("season_line", "") or "",
+        brand_line="",
+    )
+
+def build_result_text_multi(user_id: int, caption: str) -> Optional[str]:
+    blocks = _split_positions(caption)
+    if not blocks:
+        return None
+    chunks = [build_result_text_for_block(user_id, b) for b in blocks]
+    # Соединяем двойным переносом: блок1, пустая строка, блок2, ...
+    return "\n\n".join(chunks).strip()
+
 # ====== КОМАНДЫ ======
 @router.message(Command(commands=list(MODES.keys())))
 async def set_mode(msg: Message):
@@ -771,6 +834,14 @@ async def ping(msg: Message):
 
 # ====== СБОРКА ПОДПИСИ ======
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
+    """
+    1) Пытаемся собрать мульти-позиции по абзацам. Если найдено >=2 валидных блоков, собираем их.
+    2) Иначе — стандартная одиночная логика.
+    """
+    multi = build_result_text_multi(user_id, caption)
+    if multi:
+        return multi
+
     data = parse_input(caption)
     price = data.get("price")
     if price is None:
