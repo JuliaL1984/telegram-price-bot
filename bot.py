@@ -83,7 +83,6 @@ def _arm_batch_timer(chat_id: int, rec: BatchRec):
         q = _get_q(chat_id)
         if rec in q and not rec.media:
             q.remove(rec)
-            # раньше тут был форвард текста; теперь — тишина
             return
     rec.timer = asyncio.create_task(_fire())
 
@@ -94,12 +93,9 @@ async def _publish_batch_pair(chat_id: int, rec: BatchRec):
     if not rec.text_msg or not rec.media:
         return
 
-    # Определим порядок (что пришло раньше)
     text_mid = rec.text_msg.message_id
     first_media_mid = min(m["mid"] for m in rec.media)
     user_id = rec.user_id or (rec.text_msg.from_user.id if rec.text_msg.from_user else 0)
-
-    # Общий seq-барьер — минимальный из сообщений партии
     seq_first = min(text_mid, first_media_mid)
 
     async def _send_text():
@@ -126,10 +122,6 @@ async def _publish_batch_pair(chat_id: int, rec: BatchRec):
         await _send_text()
 
 def _attach_media_to_next_batch(chat_id: int, media_items: List[Dict[str, Any]], user_id: int) -> bool:
-    """
-    Находит самую раннюю партию без медиа, прикрепляет к ней и публикует парой.
-    Возвращает True, если медиа использованы; иначе False.
-    """
     q = _get_q(chat_id)
     for rec in list(q):
         if rec.media:
@@ -145,7 +137,7 @@ def _attach_media_to_next_batch(chat_id: int, media_items: List[Dict[str, Any]],
 # payload: (seq, first_mid, user_id, items, caption, album_ocr_on)
 publish_queue: "asyncio.Queue[Tuple[int, int, int, List[Dict[str, Any]], str, bool]]" = asyncio.Queue()
 _heap: List[Tuple[int, int, Tuple[int, int, int, List[Dict[str, Any]], str, bool]]] = []
-_heap_tie = 0  # чтобы различать одинаковые seq (на всякий случай)
+_heap_tie = 0
 
 def calc_seq_by_first_mid(first_mid: int) -> int:
     return int(first_mid)
@@ -159,11 +151,9 @@ def is_ocr_enabled_for(user_id: int) -> bool:
     return FILTER_PRICETAGS_IN_ALBUMS
 
 async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, album_ocr_on: bool):
-    """Реальная отправка сообщений (фото/видео/альбомы/текст/форвард)."""
     if not items:
         return
 
-    # Форвард оригинала — сохраняет активные эмодзи/эффекты
     if items and items[0].get("kind") == "forward":
         it = items[0]
         try:
@@ -177,12 +167,10 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
                 await bot.send_message(TARGET_CHAT_ID, caption)
         return
 
-    # Текстовый пост «как есть»
     if items and items[0].get("kind") == "text":
         await bot.send_message(TARGET_CHAT_ID, caption or "")
         return
 
-    # OCR-фильтрация только для альбомов при album_ocr_on=True
     items = await filter_pricetag_media(items, album_ocr_on)
 
     if len(items) == 1:
@@ -193,7 +181,6 @@ async def _do_publish(user_id: int, items: List[Dict[str, Any]], caption: str, a
             await bot.send_photo(TARGET_CHAT_ID, it["fid"], caption=caption)
         return
 
-    # Альбом: подпись на первом
     first = items[0]
     media = []
     if first["kind"] == "video":
@@ -212,8 +199,6 @@ async def publish_worker():
         _heap_tie += 1
         heapq.heappush(_heap, (seq, _heap_tie, payload))
         publish_queue.task_done()
-
-        # Выпускаем всё, что есть, по возрастанию seq
         while _heap:
             _, _, pl = heapq.heappop(_heap)
             _seq, first_mid, user_id, items, caption, album_ocr_on = pl
@@ -228,12 +213,10 @@ async def publish_to_target(first_mid: int, user_id: int, items: List[Dict[str, 
     await publish_queue.put((seq, first_mid, user_id, items, caption, album_ocr_on))
 
 # ====== OCR ======
-# Инициализация Google Vision (если есть VISION_JSON)
 GV_CLIENT = None
 if OCR_ENABLED and VISION_JSON:
     try:
         from google.cloud import vision as gv
-        # Разрешаем как JSON-текст, так и JSON-файл (путь)
         creds_dict = None
         if VISION_JSON.startswith("{"):
             creds_dict = json.loads(VISION_JSON)
@@ -241,7 +224,6 @@ if OCR_ENABLED and VISION_JSON:
             creds = svc.Credentials.from_service_account_info(creds_dict)
             GV_CLIENT = gv.ImageAnnotatorClient(credentials=creds)
         else:
-            # предполагаем путь к файлу
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = VISION_JSON
             GV_CLIENT = gv.ImageAnnotatorClient()
         print("Google Vision: initialized")
@@ -249,7 +231,6 @@ if OCR_ENABLED and VISION_JSON:
         GV_CLIENT = None
         print("Google Vision init failed:", repr(e))
 
-# Инициализация Tesseract
 TESS_AVAILABLE = False
 if OCR_ENABLED:
     try:
@@ -262,17 +243,13 @@ if OCR_ENABLED:
 
 _PRICE_TOKEN_RE = re.compile(
     r"""(?xi)
-    (?:                # слева символ €
-        [€]\s*\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?
-     |                 # или справа символ €
-        \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*[€]
-     |                 # или EUR/euro
-        \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:eur|euro)
+    (?:[€]\s*\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?    # € слева
+     | \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*[€]    # € справа
+     | \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:eur|euro)
     )
     """
 )
 
-# дополнительно ловим «1360 -20%» или «1360€-35%»
 _PRICE_WITH_DISC_RE = re.compile(
     r"""(?xi)
     \d{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:€|eur|euro)?
@@ -281,7 +258,6 @@ _PRICE_WITH_DISC_RE = re.compile(
 )
 
 def _preprocess_for_tesseract(img):
-    # ч/б, повышение контраста/резкости — помогает для жёлтых ценников
     from PIL import ImageOps, ImageFilter
     g = ImageOps.grayscale(img)
     g = ImageOps.autocontrast(g)
@@ -325,10 +301,6 @@ def _ocr_tesseract(data: bytes) -> str:
         return ""
 
 def _ocr_extract_text(data: bytes) -> Tuple[str, str]:
-    """
-    Возвращает (engine, text), где engine ∈ {"GV","TESS",""}.
-    Сначала пробуем Google Vision, потом Tesseract.
-    """
     if GV_CLIENT:
         t = _ocr_google_vision(data)
         if t:
@@ -345,12 +317,10 @@ def _looks_like_price_text(text: str) -> bool:
     low = text.lower()
     has_kw = any(k in low for k in ("retail", "prezzo", "price", "eur", "%"))
     has_token = bool(_PRICE_TOKEN_RE.search(text)) or bool(_PRICE_WITH_DISC_RE.search(text))
-    # Делаем фильтр мягче: если есть явный «€»/«eur» И есть число — тоже ок
     has_basic = ("€" in text or "eur" in low or "euro" in low) and bool(re.search(r"\d", text))
     return has_token or (has_kw and bool(re.search(r"\d", text))) or has_basic
 
 async def ocr_should_hide(file_id: str) -> bool:
-    """Прятать ли фото-ценник (видео не трогаем)."""
     if not OCR_ENABLED:
         return False
     try:
@@ -367,14 +337,8 @@ async def ocr_should_hide(file_id: str) -> bool:
         return False
 
 async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool) -> List[Dict[str, Any]]:
-    """
-    Одиночные: ничего не удаляем.
-    Альбомы: при album_ocr_on=True — вырезаем ТОЛЬКО кадры-ценники (видео не режем).
-    Порядок сохраняем. Если всё вырезалось — оставляем первый кадр.
-    """
     if len(items) == 1 or not album_ocr_on:
         return items
-
     kept: List[Dict[str, Any]] = []
     for it in items:
         if it["kind"] == "photo":
@@ -383,8 +347,6 @@ async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool)
                 kept.append(it)
         else:
             kept.append(it)
-
-    # Гарантируем, что альбом не пустой
     return kept if kept else items[:1]
 
 # ====== КАЛЬКУЛЯТОРЫ ======
@@ -417,7 +379,7 @@ def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# === РАЗМЕРЫ: EU 30–46, US 5–12 (с половинками) и BAL 1–6 ===
+# === РАЗМЕРЫ ===
 SIZE_ALPHA   = r"(?:XXS|XS|S|M|L|XL|XXL)"
 SIZE_NUM_EU  = r"(?:3\d|4[0-6])(?:[.,]5)?"
 SIZE_NUM_US  = r"(?:[5-9]|1[0-2])(?:[.,]5)?"
@@ -429,17 +391,14 @@ def _strip_seasons_for_size_scan(text: str) -> str:
     return re.sub(r"\b(?:NEW\s+)?(?:FW|SS)\d+(?:/\d+)?\b", " ", text, flags=re.I)
 
 def _strip_discounts_and_prices(text: str) -> str:
-    # поддерживаем -, –, —, − и удаляем ценники любой длины
     text = re.sub(r"[–—\-−]\s?\d{1,2}\s?%", " ", text)
     text = re.sub(_PRICE_TOKEN_RE, " ", text)
     return text
 
 def extract_sizes_anywhere(text: str) -> str:
-    """Достаём размеры из любого места, сохраняя порядок и без дублей."""
     work = _strip_seasons_for_size_scan(text)
     work = _strip_discounts_and_prices(work)
 
-    # Диапазоны: "36-41", "36/41", "6-10", "6/10", "1-3"
     ranges_dash  = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})\s*[-–—]\s*({SIZE_NUM_ANY})(?!\d)", work)
     ranges_slash = re.findall(rf"(?<!\d)({SIZE_NUM_ANY})\s*/\s*({SIZE_NUM_ANY})(?!\d)", work)
 
@@ -456,11 +415,9 @@ def extract_sizes_anywhere(text: str) -> str:
 
     for a, b in (ranges_dash + ranges_slash):
         add(f"{a.replace('.5', ',5')}-{b.replace('.5', ',5')}")
-
     for t in singles_alpha:
         add(t.upper())
 
-    # Исключаем числа, попавшие внутрь диапазонов
     covered_nums = set()
     def _expand(n1: str, n2: str):
         try:
@@ -475,7 +432,6 @@ def extract_sizes_anywhere(text: str) -> str:
             s = ("{:.1f}".format(x)).replace(".5", ",5").rstrip("0").rstrip(",")
             covered_nums.add(s)
             x += 0.5
-
     for a, b in (ranges_dash + ranges_slash):
         _expand(a, b)
 
@@ -485,7 +441,6 @@ def extract_sizes_anywhere(text: str) -> str:
             continue
         add(norm)
 
-    # --- Антишум: одиночный реальный размер не выбрасываем ---
     evidence_of_ranges = bool(ranges_dash or ranges_slash)
     has_alpha = bool(singles_alpha)
     if not evidence_of_ranges and not has_alpha:
@@ -505,16 +460,14 @@ def extract_sizes_anywhere(text: str) -> str:
             return ""
     return ", ".join(parts)
 
-# --- УНИВЕРСАЛЬНЫЙ ПАРСЕР ДЕНЕГ (495.00, 495,00, 2.950, 2,950 и т.п.) ---
+# --- УНИВЕРСАЛЬНЫЙ ПАРСЕР ДЕНЕГ ---
 def parse_money_token(token: Optional[str]) -> Optional[float]:
     if not token:
         return None
     s = re.sub(r"[^\d.,]", "", token)
     if not s:
         return None
-    # оба разделителя присутствуют
     if "," in s and "." in s:
-        # Десятичный — тот, что справа
         if s.rfind(",") > s.rfind("."):
             dec, thou = ",", "."
         else:
@@ -524,22 +477,18 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
             return float(s)
         except ValueError:
             return None
-    # только запятые
     if "," in s and "." not in s:
-        # одиночная запятая и 1–2 цифры справа трактуем как десятичную
         if s.count(",") == 1 and re.search(r",\d{1,2}$", s):
             s = s.replace(",", ".")
             try:
                 return float(s)
             except ValueError:
                 return None
-        # иначе считаем разделителем тысяч
         s = s.replace(",", "")
         try:
             return float(s)
         except ValueError:
             return None
-    # только точки
     if "." in s and "," not in s:
         if s.count(".") == 1 and re.search(r"\.\d{1,2}$", s):
             try:
@@ -551,19 +500,18 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
             return float(s)
         except ValueError:
             return None
-    # только цифры
     try:
         return float(s)
     except ValueError:
         return None
 
-# --- NEW: универсальный парсер цены и скидки (понимает 1360-20%, 1360€ -20% и т.п.) ---
+# --- ПАРА «цена-скидка» ---
 PRICE_DISCOUNT_RE = re.compile(
     r"""
-    (?P<price>\d{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)   # цена (тысячи/копейки)
-    \s*(?:€|eur|euro)?\s*                               # необязательное обозначение евро
-    (?:-|—|–|\s-\s|\s—\s|\s–\s)?                        # необязательное тире/минус
-    \s*(?P<discount>\d{1,2})\s*%                        # скидка
+    (?P<price>\d{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)   # цена
+    \s*(?:€|eur|euro)?\s*
+    (?:-|—|–|\s-\s|\s—\s|\s–\s)?
+    \s*(?P<discount>\d{1,2})\s*%
     """,
     re.IGNORECASE | re.VERBOSE | re.S
 )
@@ -582,7 +530,7 @@ def parse_price_discount(text: str) -> Tuple[Optional[float], Optional[int]]:
         return (None, None)
     return (price, disc)
 
-# --- NEW: парсер блока "Размеры:" ---
+# --- Блок «Размеры: ...» ---
 SIZES_BLOCK_RE = re.compile(r"Размеры:\s*(?P<body>.+?)(?:\n\s*\n|#|$)", re.I | re.S)
 SIZE_ITEM_RE   = re.compile(r"\b(XXS|XS|S|M|L|XL|XXL|\d{2}(?:[.,]5)?)\b", re.I)
 
@@ -598,17 +546,10 @@ def parse_sizes_block(text: str) -> str:
             seen.add(v); out.append(v)
     return ", ".join(out)
 
-# --- NEW: определение «ценовой» строки (для эвристик размеров) ---
 def _is_price_line(l: str) -> bool:
-    return bool(re.search(r"(€|%|\bretail\b|\bprice\b)", l, flags=re.I))
+    return bool(PRICE_DISCOUNT_RE.search(l) or re.search(r"\d{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*(€|eur|euro)", l, flags=re.I))
 
 def pick_sizes_line(lines: List[str]) -> str:
-    """
-    Выбираем лучшую строку с размерами.
-    Приоритет 1: алфавитные размеры или перечисления/диапазоны.
-    Приоритет 2: одиночный числовой размер, НО не вплотную к строке с ценой.
-    """
-    # --- Pass 1: «сильные» кандидаты ---
     for line in lines:
         l = line.strip()
         if not l or _is_price_line(l):
@@ -619,7 +560,6 @@ def pick_sizes_line(lines: List[str]) -> str:
             return l
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}\s*[-–/]\s*{SIZE_NUM_ANY}(?!\d)", l):
             return l
-    # --- Pass 2: одиночный размер, но не рядом с ценой ---
     for i, line in enumerate(lines):
         l = line.strip()
         if not l or _is_price_line(l):
@@ -645,74 +585,26 @@ def parse_number_token(token: Optional[str]) -> Optional[float]:
     return parse_money_token(token)
 
 # ========= МУЛЬТИ-ПОЗИЦИИ =========
-POS_SPLIT_RE = re.compile(r"\n\s*\n+")  # делим по пустым строкам (абзацы)
+POS_SPLIT_RE = re.compile(r"\n\s*\n+")
 PRICE_TOKEN_OR_PAIR_RE = re.compile(
     rf"(?:{PRICE_DISCOUNT_RE.pattern})|(?:\d{{2,6}}(?:[.,]\d{{3}})*(?:[.,]\d{{1,2}})?\s*(?:€|eur|euro))",
     re.IGNORECASE | re.VERBOSE | re.S,
 )
 
-def _split_positions_by_price_lines(caption: str) -> List[str]:
-    """
-    Фолбэк на случай, когда позиций несколько, но они записаны в одном абзаце
-    (например: 'Верх 1.100€-30% ...\\n...\\nНиз 990€-30% ...').
-    Режем по строкам с ценой и забираем контекст до следующей цены.
-    """
-    lines = [l for l in (caption or "").splitlines() if l.strip()]
-    if len(lines) < 2:
-        return []
-
-    price_idx = [i for i, l in enumerate(lines) if PRICE_TOKEN_OR_PAIR_RE.search(l)]
-    if len(price_idx) < 2:
-        return []
-
-    blocks: List[str] = []
-    for k, i in enumerate(price_idx):
-        j = price_idx[k + 1] if k + 1 < len(price_idx) else len(lines)
-
-        # попытка захватить короткий заголовок перед ценой (Верх/Низ/Юбка/Топ/Брюки/Пальто и т.п.)
-        start = i
-        if i - 1 >= 0:
-            prev = lines[i - 1].strip()
-            if (not PRICE_TOKEN_OR_PAIR_RE.search(prev)) and len(prev) <= 25 and not _is_price_line(prev):
-                start = i - 1
-
-        block = "\n".join(lines[start:j]).strip()
-        if PRICE_TOKEN_OR_PAIR_RE.search(block):
-            blocks.append(block)
-
-    return blocks
-
-def _split_positions(caption: str) -> List[str]:
-    """
-    Делим подпись на абзацы по пустым строкам. Если так не получилось найти >=2
-    валидных кусков, пробуем разрезать по строкам, содержащим цену/скидку.
-    """
-    blocks = [b.strip() for b in POS_SPLIT_RE.split(caption.strip()) if b.strip()]
-    good = [b for b in blocks if PRICE_TOKEN_OR_PAIR_RE.search(b)]
-    if len(good) >= 2:
-        return good
-    # фолбэк по строкам с ценой
-    return _split_positions_by_price_lines(caption)
-
 def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     text = cleanup_text_basic(raw_text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # NEW: пробуем универсальный парсер (поддерживает 1360-20%)
     price_uni, discount_uni = parse_price_discount(text)
 
-    # Старые совместимые шаблоны (цена только с €)
     price_m    = re.search(r"(\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*€", text)
     discount_m = re.search(r"[–—\-−]\s*(\d{1,2})\s*%", text)
-    # Позволяем в retail как тысячи, так и десятичные копейки
     retail_m   = re.search(r"Retail\s*price\s*(\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)", text, flags=re.I)
 
-    # Итоговые значения
     price    = price_uni if price_uni is not None else (parse_number_token(price_m.group(1)) if price_m else None)
     discount = discount_uni if discount_uni is not None else (int(discount_m.group(1)) if discount_m else 0)
     retail   = parse_number_token(retail_m.group(1)) if retail_m else (price if price is not None else 0.0)
 
-    # Важно: сначала пытаемся вытащить размеры из блока "Размеры:", иначе — эвристики
     sizes_line  = parse_sizes_block(text) or pick_sizes_line(lines) or extract_sizes_anywhere(text)
     season_line = pick_season_line(lines)
 
@@ -726,13 +618,77 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
         "cleaned_text": text,
     }
 
+# --- НОВОЕ: разрезание по «ценовым строкам» (работает и без пустых абзацев) ---
+def _split_by_price_lines(caption: str) -> List[str]:
+    rows = [r for r in (caption or "").splitlines()]
+    blocks: List[List[str]] = []
+    cur: List[str] = []
+    saw_price_in_cur = False
+
+    def flush():
+        nonlocal cur, saw_price_in_cur
+        if cur and saw_price_in_cur:
+            blocks.append([s for s in cur if s.strip()])
+        cur, saw_price_in_cur = [], False
+
+    for r in rows:
+        cur.append(r)
+        if _is_price_line(r):
+            saw_price_in_cur = True
+            # если следующая строка тоже ценовая — закроем блок на переходе
+    # финальный сброс
+    flush()
+    return ["\n".join(b).strip() for b in blocks if b]
+
+def _split_positions(caption: str) -> List[str]:
+    # 1) сначала пытаемся по ценовым строкам
+    by_price = _split_by_price_lines(caption)
+    if len(by_price) >= 2:
+        return by_price
+    # 2) иначе — старый вариант по пустым строкам
+    blocks = [b.strip() for b in POS_SPLIT_RE.split(caption.strip()) if b.strip()]
+    if len(blocks) <= 1:
+        return []
+    good = [b for b in blocks if PRICE_TOKEN_OR_PAIR_RE.search(b)]
+    return good if len(good) >= 2 else []
+
+def build_result_text_for_block(user_id: int, text_block: str) -> str:
+    data = parse_input(text_block)
+    price = data.get("price")
+    mode = MODES.get(active_mode.get(user_id, "sale"), MODES["sale"])
+    calc_fn, tpl_fn = mode["calc"], mode["template"]
+    if price is None:
+        hint = "⚠️ Не нашла цену. Пример: 650€ -35% или 1360-20%"
+        sizes = (data.get("sizes_line") or "").strip()
+        season = (data.get("season_line") or "").strip()
+        parts = [hint]
+        if sizes: parts.append(sizes)
+        if season: parts.append(season)
+        return "\n".join(parts)
+    final_price = calc_fn(float(price), int(data.get("discount", 0)))
+    return tpl_fn(
+        final_price=final_price,
+        retail=float(data.get("retail", 0.0) or 0.0),
+        sizes_line=data.get("sizes_line", "") or "",
+        season_line=data.get("season_line", "") or "",
+        brand_line="",
+    )
+
+def build_result_text_multi(user_id: int, caption: str) -> Optional[str]:
+    blocks = _split_positions(caption)
+    if not blocks:
+        return None
+    chunks = [build_result_text_for_block(user_id, b) for b in blocks]
+    # один пустой ряд между позициями
+    return ("\n".join(chunks)).strip()
+
+# ====== КОМАНДЫ ======
 def template_five_lines(final_price: int,
                         retail: float,
                         sizes_line: str,
                         season_line: str,
                         brand_line: str) -> str:
     line1 = f"✅ <b>{ceil_price(final_price)}€</b>"
-    # Показываем retail только если он не меньше моей цены
     show_retail = bool(retail) and (ceil_price(final_price) <= ceil_price(retail))
     line2 = f"❌ <b>Retail price {ceil_price(retail)}€</b>" if show_retail else ""
     line3 = sizes_line or ""
@@ -755,7 +711,6 @@ def mk_mode(label: str,
             template: Callable[[int, float, str, str, str], str] = template_five_lines):
     return {"label": label, "calc": calc, "template": template}
 
-# ====== РЕЖИМЫ ======
 MODES: Dict[str, Dict] = {
     "sale": mk_mode("SALE"),
     "lux": mk_mode("LUX", calc=lux_calc),          # OCR off
@@ -793,39 +748,6 @@ MODES: Dict[str, Dict] = {
 def is_admin(user_id: int) -> bool:
     return (not ADMINS) or (user_id in ADMINS)
 
-# ====== ХЕЛПЕРЫ ДЛЯ МУЛЬТИ-ПОЗИЦИЙ ======
-def build_result_text_for_block(user_id: int, text_block: str) -> str:
-    data = parse_input(text_block)
-    price = data.get("price")
-    mode = MODES.get(active_mode.get(user_id, "sale"), MODES["sale"])
-    calc_fn, tpl_fn = mode["calc"], mode["template"]
-    if price is None:
-        # мягкий фолбэк — показываем размеры/сезон и подсказку по цене
-        hint = "⚠️ Не нашла цену. Пример: 650€ -35% или 1360-20%"
-        sizes = (data.get("sizes_line") or "").strip()
-        season = (data.get("season_line") or "").strip()
-        parts = [hint]
-        if sizes: parts.append(sizes)
-        if season: parts.append(season)
-        return "\n".join(parts)
-    final_price = calc_fn(float(price), int(data.get("discount", 0)))
-    return tpl_fn(
-        final_price=final_price,
-        retail=float(data.get("retail", 0.0) or 0.0),
-        sizes_line=data.get("sizes_line", "") or "",
-        season_line=data.get("season_line", "") or "",
-        brand_line="",
-    )
-
-def build_result_text_multi(user_id: int, caption: str) -> Optional[str]:
-    blocks = _split_positions(caption)
-    if not blocks:
-        return None
-    chunks = [build_result_text_for_block(user_id, b) for b in blocks]
-    # Соединяем двойным переносом: блок1, пустая строка, блок2, ...
-    return "\n\n".join(chunks).strip()
-
-# ====== КОМАНДЫ ======
 @router.message(Command(commands=list(MODES.keys())))
 async def set_mode(msg: Message):
     user_id = msg.from_user.id
@@ -859,11 +781,6 @@ async def ping(msg: Message):
 
 # ====== СБОРКА ПОДПИСИ ======
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
-    """
-    1) Пытаемся собрать мульти-позиции по абзацам. Если найдено >=2 валидных блоков, собираем их.
-    2) Иначе — пробуем разрезать по строкам с ценой (кейс «Верх/Низ» в одном абзаце).
-    3) Если ничего не нашли — стандартная одиночная логика.
-    """
     multi = build_result_text_multi(user_id, caption)
     if multi:
         return multi
@@ -899,7 +816,6 @@ async def handle_single_photo(msg: Message):
     item = {"kind": "photo", "fid": msg.photo[-1].file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
 
-    # Если есть ожидающая партия — прикрепляем и публикуем как пара
     if _attach_media_to_next_batch(msg.chat.id, [item], msg.from_user.id):
         return
 
@@ -975,7 +891,6 @@ async def handle_album_any(msg: Message):
 
         items.sort(key=lambda x: x["mid"])
 
-        # Если есть ожидающая партия и у альбома нет ценовой подписи — прикрепляем к партии
         if not caption:
             if _attach_media_to_next_batch(chat_id, items, user_id):
                 return
@@ -999,7 +914,6 @@ async def handle_album_any(msg: Message):
 @router.message(F.text)
 async def handle_text(msg: Message):
     txt = msg.text or ""
-    # NEW: распознаём цену без знака €
     has_price_token = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt, flags=re.I))
     has_discount    = bool(re.search(r"[–—\-−]?\s*\d{1,2}\s?%", txt))
     has_pair        = bool(PRICE_DISCOUNT_RE.search(txt))
@@ -1009,11 +923,9 @@ async def handle_text(msg: Message):
     is_forward = bool(getattr(msg, "forward_origin", None))
     chat_id = msg.chat.id
 
-    # 🔕 Пересланные тексты без цены (включая эмодзи) — НЕ публикуем
     if not has_price and is_forward:
         return
 
-    # Партии «текст → медиа» оставляем только для НЕпересланных и только для админов
     if not has_pair and not has_price_token and has_custom and not is_forward and is_admin(msg.from_user.id):
         q = _get_q(chat_id)
         rec = BatchRec(text_msg=msg, user_id=msg.from_user.id)
@@ -1021,7 +933,6 @@ async def handle_text(msg: Message):
         _arm_batch_timer(chat_id, rec)
         return
 
-    # Привязка к одиночным медиа, отправленным ранее (окно ALBUM_WINDOW_SECONDS)
     bucket = last_media.get(chat_id)
     if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
         user_id = bucket.get("user_id") or msg.from_user.id
@@ -1045,7 +956,6 @@ async def handle_text(msg: Message):
         del last_media[chat_id]
         return
 
-    # Привязка текста к самому свежему альбому этого чата (если ещё «дышит»)
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
@@ -1078,7 +988,6 @@ async def handle_text(msg: Message):
             )
         return
 
-    # Чистые тексты без цены и без custom_emoji — отправляем как текст
     if not has_price and not has_custom:
         text_item = [{"kind": "text", "fid": "", "mid": msg.message_id, "cap": True}]
         await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=text_item, caption=txt)
