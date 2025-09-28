@@ -608,22 +608,17 @@ def pick_sizes_line(lines: List[str]) -> str:
     Приоритет 1: алфавитные размеры или перечисления/диапазоны.
     Приоритет 2: одиночный числовой размер, НО не вплотную к строке с ценой.
     """
-
     # --- Pass 1: «сильные» кандидаты ---
     for line in lines:
         l = line.strip()
         if not l or _is_price_line(l):
             continue
-        # XS…XXL
         if re.search(rf"\b({SIZE_ALPHA})\b", l, flags=re.I):
             return l
-        # перечисления 39/40/41, 36,5/37, 1,2,3
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}(?:\s*(?:[,/]\s*{SIZE_NUM_ANY}))+?(?!\d)", l):
             return l
-        # диапазоны 36-41, 6–10, 1-3
         if re.search(rf"(?<!\d){SIZE_NUM_ANY}\s*[-–/]\s*{SIZE_NUM_ANY}(?!\d)", l):
             return l
-
     # --- Pass 2: одиночный размер, но не рядом с ценой ---
     for i, line in enumerate(lines):
         l = line.strip()
@@ -635,7 +630,6 @@ def pick_sizes_line(lines: List[str]) -> str:
             if prev_is_price or next_is_price:
                 continue
             return l
-
     return ""
 
 def pick_season_line(lines: List[str]) -> str:
@@ -656,6 +650,49 @@ PRICE_TOKEN_OR_PAIR_RE = re.compile(
     rf"(?:{PRICE_DISCOUNT_RE.pattern})|(?:\d{{2,6}}(?:[.,]\d{{3}})*(?:[.,]\d{{1,2}})?\s*(?:€|eur|euro))",
     re.IGNORECASE | re.VERBOSE | re.S,
 )
+
+def _split_positions_by_price_lines(caption: str) -> List[str]:
+    """
+    Фолбэк на случай, когда позиций несколько, но они записаны в одном абзаце
+    (например: 'Верх 1.100€-30% ...\\n...\\nНиз 990€-30% ...').
+    Режем по строкам с ценой и забираем контекст до следующей цены.
+    """
+    lines = [l for l in (caption or "").splitlines() if l.strip()]
+    if len(lines) < 2:
+        return []
+
+    price_idx = [i for i, l in enumerate(lines) if PRICE_TOKEN_OR_PAIR_RE.search(l)]
+    if len(price_idx) < 2:
+        return []
+
+    blocks: List[str] = []
+    for k, i in enumerate(price_idx):
+        j = price_idx[k + 1] if k + 1 < len(price_idx) else len(lines)
+
+        # попытка захватить короткий заголовок перед ценой (Верх/Низ/Юбка/Топ/Брюки/Пальто и т.п.)
+        start = i
+        if i - 1 >= 0:
+            prev = lines[i - 1].strip()
+            if (not PRICE_TOKEN_OR_PAIR_RE.search(prev)) and len(prev) <= 25 and not _is_price_line(prev):
+                start = i - 1
+
+        block = "\n".join(lines[start:j]).strip()
+        if PRICE_TOKEN_OR_PAIR_RE.search(block):
+            blocks.append(block)
+
+    return blocks
+
+def _split_positions(caption: str) -> List[str]:
+    """
+    Делим подпись на абзацы по пустым строкам. Если так не получилось найти >=2
+    валидных кусков, пробуем разрезать по строкам, содержащим цену/скидку.
+    """
+    blocks = [b.strip() for b in POS_SPLIT_RE.split(caption.strip()) if b.strip()]
+    good = [b for b in blocks if PRICE_TOKEN_OR_PAIR_RE.search(b)]
+    if len(good) >= 2:
+        return good
+    # фолбэк по строкам с ценой
+    return _split_positions_by_price_lines(caption)
 
 def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
     text = cleanup_text_basic(raw_text)
@@ -757,18 +794,6 @@ def is_admin(user_id: int) -> bool:
     return (not ADMINS) or (user_id in ADMINS)
 
 # ====== ХЕЛПЕРЫ ДЛЯ МУЛЬТИ-ПОЗИЦИЙ ======
-def _split_positions(caption: str) -> List[str]:
-    """
-    Делим подпись на абзацы по пустым строкам.
-    Возвращаем только те куски, где есть явная цена/скидка или €.
-    """
-    blocks = [b.strip() for b in POS_SPLIT_RE.split(caption.strip()) if b.strip()]
-    if len(blocks) <= 1:
-        return []
-    good = [b for b in blocks if PRICE_TOKEN_OR_PAIR_RE.search(b)]
-    # если после фильтра осталось <2, считаем, что это не мульти-кейс
-    return good if len(good) >= 2 else []
-
 def build_result_text_for_block(user_id: int, text_block: str) -> str:
     data = parse_input(text_block)
     price = data.get("price")
@@ -836,7 +861,8 @@ async def ping(msg: Message):
 def build_result_text(user_id: int, caption: str) -> Optional[str]:
     """
     1) Пытаемся собрать мульти-позиции по абзацам. Если найдено >=2 валидных блоков, собираем их.
-    2) Иначе — стандартная одиночная логика.
+    2) Иначе — пробуем разрезать по строкам с ценой (кейс «Верх/Низ» в одном абзаце).
+    3) Если ничего не нашли — стандартная одиночная логика.
     """
     multi = build_result_text_multi(user_id, caption)
     if multi:
