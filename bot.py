@@ -4,7 +4,7 @@
 # Версия с 5-строчной подписью, точным парсингом размеров/сезона,
 # и двумя режимами: /lux (OCR off) и /luxocr (OCR on), одинаковая формула.
 # Округление всегда вверх; бренд из подписи удалён.
-# Альбомы БЕЗ подписи публикуются сразу (без ожидания текста).
+# Альбомы БЕЗ подписи не публикуются сразу — ждут текст и склеиваются.
 
 import os
 import re
@@ -29,18 +29,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002973176038"))
 ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "1500"))  # стабильнее собирает альбомы
-ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))
-
-# Сколько держать текст с эмодзи в ожидании фото (очереди партий)
-BATCH_IDLE_MS = int(os.getenv("BATCH_IDLE_MS", "2800"))
+ALBUM_SETTLE_MS = int(os.getenv("ALBUM_SETTLE_MS", "1500"))   # сбор кадров одного альбома
+ALBUM_WINDOW_SECONDS = int(os.getenv("ALBUM_WINDOW_SECONDS", "30"))  # максимум ожидания текста
+BATCH_IDLE_MS = int(os.getenv("BATCH_IDLE_MS", "2800"))       # пауза для склейки "текстов подписи"
 
 # OCR
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_LANG = os.getenv("OCR_LANG", "ita+eng")
-VISION_JSON = os.getenv("VISION_JSON", "").strip()  # если есть — используем Google Vision
+VISION_JSON = os.getenv("VISION_JSON", "").strip()
 
-# Базовая политика: в альбомах убирать кадры-ценники (1 — да; 0 — пересылать как есть)
+# Политика: в альбомах убирать кадры-ценники (1 — да; 0 — как есть)
 FILTER_PRICETAGS_IN_ALBUMS = os.getenv("FILTER_PRICETAGS_IN_ALBUMS", "1") == "1"
 
 # ====== ИНИЦИАЛИЗАЦИЯ ======
@@ -53,9 +51,9 @@ dp.include_router(router)
 # MediaItem: {"kind": "photo"|"video"|"text"|"forward", "fid": str, "mid": int, "cap": bool}
 last_media: Dict[int, Dict[str, Any]] = {}
 active_mode: Dict[int, str] = {}
-album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
+album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}  # временный сбор одного media_group
 
-# -------- Очередь партий (FIFO) для текстов-эмодзи и их медиа --------
+# --- Очередь партий (текст с кастом-эмодзи → фото/видео) ---
 @dataclass
 class BatchRec:
     text_msg: Optional[Message] = None
@@ -72,7 +70,6 @@ def _get_q(chat_id: int) -> deque:
     return q
 
 def _arm_batch_timer(chat_id: int, rec: BatchRec):
-    # Если медиа не придут вовремя — ничего не публикуем (чтобы "ничего не улетало")
     if rec.timer:
         rec.timer.cancel()
     async def _fire():
@@ -87,12 +84,10 @@ def _arm_batch_timer(chat_id: int, rec: BatchRec):
     rec.timer = asyncio.create_task(_fire())
 
 async def _publish_batch_pair(chat_id: int, rec: BatchRec):
-    """Публикуем текст и медиа в ТОЧНОМ исходном порядке по message_id."""
     if rec.timer:
         rec.timer.cancel()
     if not rec.text_msg or not rec.media:
         return
-
     text_mid = rec.text_msg.message_id
     first_media_mid = min(m["mid"] for m in rec.media)
     user_id = rec.user_id or (rec.text_msg.from_user.id if rec.text_msg.from_user else 0)
@@ -105,21 +100,13 @@ async def _publish_batch_pair(chat_id: int, rec: BatchRec):
             items=[{"kind": "forward", "from_chat_id": rec.text_msg.chat.id, "mid": rec.text_msg.message_id, "cap": True}],
             caption=""
         )
-
     async def _send_media():
-        await publish_to_target(
-            first_mid=seq_first,
-            user_id=user_id,
-            items=rec.media,
-            caption=""
-        )
+        await publish_to_target(first_mid=seq_first, user_id=user_id, items=rec.media, caption="")
 
     if text_mid <= first_media_mid:
-        await _send_text()
-        await _send_media()
+        await _send_text(); await _send_media()
     else:
-        await _send_media()
-        await _send_text()
+        await _send_media(); await _send_text()
 
 def _attach_media_to_next_batch(chat_id: int, media_items: List[Dict[str, Any]], user_id: int) -> bool:
     q = _get_q(chat_id)
@@ -133,8 +120,7 @@ def _attach_media_to_next_batch(chat_id: int, media_items: List[Dict[str, Any]],
         return True
     return False
 
-# ====== ГЛОБАЛЬНЫЙ ПОРЯДОК ПО message_id (min-heap) ======
-# payload: (seq, first_mid, user_id, items, caption, album_ocr_on)
+# ====== ПАРАЛЛЕЛЬНАЯ ПУБЛИКАЦИЯ С ГЛОБАЛЬНЫМ ПОРЯДКОМ ======
 publish_queue: "asyncio.Queue[Tuple[int, int, int, List[Dict[str, Any]], str, bool]]" = asyncio.Queue()
 _heap: List[Tuple[int, int, Tuple[int, int, int, List[Dict[str, Any]], str, bool]]] = []
 _heap_tie = 0
@@ -217,7 +203,6 @@ GV_CLIENT = None
 if OCR_ENABLED and VISION_JSON:
     try:
         from google.cloud import vision as gv
-        creds_dict = None
         if VISION_JSON.startswith("{"):
             creds_dict = json.loads(VISION_JSON)
             import google.oauth2.service_account as svc
@@ -243,13 +228,12 @@ if OCR_ENABLED:
 
 _PRICE_TOKEN_RE = re.compile(
     r"""(?xi)
-    (?:[€]\s*\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?    # € слева
-     | \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*[€]    # € справа
+    (?:[€]\s*\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?
+     | \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*[€]
      | \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:eur|euro)
     )
     """
 )
-
 _PRICE_WITH_DISC_RE = re.compile(
     r"""(?xi)
     \d{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:€|eur|euro)?
@@ -379,7 +363,6 @@ def cleanup_text_basic(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-# === РАЗМЕРЫ ===
 SIZE_ALPHA   = r"(?:XXS|XS|S|M|L|XL|XXL)"
 SIZE_NUM_EU  = r"(?:3\d|4[0-6])(?:[.,]5)?"
 SIZE_NUM_US  = r"(?:[5-9]|1[0-2])(?:[.,]5)?"
@@ -460,7 +443,6 @@ def extract_sizes_anywhere(text: str) -> str:
             return ""
     return ", ".join(parts)
 
-# --- УНИВЕРСАЛЬНЫЙ ПАРСЕР ДЕНЕГ ---
 def parse_money_token(token: Optional[str]) -> Optional[float]:
     if not token:
         return None
@@ -507,7 +489,7 @@ def parse_money_token(token: Optional[str]) -> Optional[float]:
 
 PRICE_DISCOUNT_RE = re.compile(
     r"""
-    (?P<price>\d{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)   # цена
+    (?P<price>\d{2,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)
     \s*(?:€|eur|euro)?\s*
     (?:-|—|–|\s-\s|\s—\s|\s–\s)?
     \s*(?P<discount>\d{1,2})\s*%
@@ -529,12 +511,10 @@ def parse_price_discount(text: str) -> Tuple[Optional[float], Optional[int]]:
         return (None, None)
     return (price, disc)
 
-# --- НОРМАЛИЗАЦИЯ «1.150 -> 1150», «2.990 -> 2990» ---
 _THOUSANDS_DOT_RE = re.compile(r'(?<!\d)(\d{1,3})\.(\d{3})(?!\d)')
 def normalize_thousands(text: str) -> str:
     return _THOUSANDS_DOT_RE.sub(r"\1\2", text)
 
-# --- Блок «Размеры: ...» ---
 SIZES_BLOCK_RE = re.compile(r"Размеры:\s*(?P<body>.+?)(?:\n\s*\n|#|$)", re.I | re.S)
 SIZE_ITEM_RE   = re.compile(r"\b(XXS|XS|S|M|L|XL|XXL|\d{2}(?:[.,]5)?)\b", re.I)
 
@@ -623,7 +603,7 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
         "cleaned_text": text,
     }
 
-# ----------- ВАЖНО: исправленный разрезатель блоков -----------
+# --- исправленный разрезатель блоков (убирает хвостовые пустые строки) ---
 def _split_by_price_lines(caption: str) -> List[str]:
     rows = (caption or "").splitlines()
     blocks: List[List[str]] = []
@@ -633,7 +613,6 @@ def _split_by_price_lines(caption: str) -> List[str]:
     def flush():
         nonlocal cur, saw_price_in_cur
         if cur and saw_price_in_cur:
-            # обрежем хвостовые пустые строки, чтобы не было большого отступа
             while cur and not cur[-1].strip():
                 cur.pop()
             if cur:
@@ -642,14 +621,11 @@ def _split_by_price_lines(caption: str) -> List[str]:
         saw_price_in_cur = False
 
     for r in rows:
-        # если пришла новая ценовая строка, а в текущем блоке уже была цена — закрываем текущий блок
         if _is_price_line(r) and saw_price_in_cur:
             flush()
         cur.append(r)
         if _is_price_line(r):
             saw_price_in_cur = True
-
-    # финальный сброс
     flush()
     return ["\n".join(b).strip() for b in blocks if b]
 
@@ -690,7 +666,6 @@ def build_result_text_multi(user_id: int, caption: str) -> Optional[str]:
     if not blocks:
         return None
     chunks = [build_result_text_for_block(user_id, b) for b in blocks]
-    # один пустой перевод между позициями
     return ("\n".join(chunks)).strip()
 
 # ====== КОМАНДЫ ======
@@ -708,10 +683,8 @@ def template_five_lines(final_price: int,
     lines = [line1, line2, line3, line4, line5]
     cleaned = []
     for s in lines:
-        if not s:
-            continue
-        if cleaned and s == cleaned[-1]:
-            continue
+        if not s: continue
+        if cleaned and s == cleaned[-1]: continue
         cleaned.append(s)
     while len(cleaned) < 5:
         cleaned.append("")
@@ -782,7 +755,7 @@ async def show_help(msg: Message):
         "Бот принимает фото/видео (альбомы) и текст с ценой.\n"
         "• /lux — OCR выключен, /luxocr — OCR включен.\n"
         "• Формула: ≤250€ +55€; 251–400€ +70€; >400€ → +10% и +30€. Всё округляем вверх.\n"
-        "• Альбом без подписи публикуется сразу.\n"
+        "• Альбом без подписи держу в ожидании текста и склеиваю в одну подпись.\n"
         "• /mode — показать текущий режим и состояние OCR."
     )
 
@@ -795,7 +768,6 @@ def build_result_text(user_id: int, caption: str) -> Optional[str]:
     multi = build_result_text_multi(user_id, caption)
     if multi:
         return multi
-
     data = parse_input(caption)
     price = data.get("price")
     if price is None:
@@ -820,6 +792,56 @@ async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[
         "user_id": user_id,
         "first_mid": first_mid,
     }
+
+# ====== НОВОЕ: ОЧЕРЕДЬ ОЖИДАЮЩИХ АЛЬБОМОВ ДЛЯ ТЕКСТА ======
+@dataclass
+class PendingAlbum:
+    items: List[Dict[str, Any]]
+    first_mid: int
+    user_id: int
+    caption_accum: str = ""
+    flush_task: Optional[asyncio.Task] = None
+    expire_task: Optional[asyncio.Task] = None  # публикация по таймауту, если так и не пришёл текст
+
+pending_albums: Dict[int, List[PendingAlbum]] = {}
+
+def _get_pending_list(chat_id: int) -> List[PendingAlbum]:
+    return pending_albums.setdefault(chat_id, [])
+
+def _start_flush_timer(chat_id: int, pa: PendingAlbum):
+    if pa.flush_task:
+        pa.flush_task.cancel()
+    async def _flush():
+        try:
+            await asyncio.sleep(BATCH_IDLE_MS/1000)  # ждём “добор” размеров/сезона
+        except asyncio.CancelledError:
+            return
+        # публикуем
+        res = build_result_text(pa.user_id, pa.caption_accum.strip())
+        caption = res if res else pa.caption_accum.strip()
+        await publish_to_target(first_mid=pa.first_mid, user_id=pa.user_id, items=pa.items, caption=caption)
+        # удалить из очереди
+        lst = _get_pending_list(chat_id)
+        if pa in lst:
+            lst.remove(pa)
+    pa.flush_task = asyncio.create_task(_flush())
+
+def _start_expire_timer(chat_id: int, pa: PendingAlbum):
+    if pa.expire_task:
+        pa.expire_task.cancel()
+    async def _expire():
+        try:
+            await asyncio.sleep(ALBUM_WINDOW_SECONDS)
+        except asyncio.CancelledError:
+            return
+        # если так и не пришёл текст — публикуем без подписи
+        res = build_result_text(pa.user_id, pa.caption_accum.strip())
+        caption = res if res else pa.caption_accum.strip()
+        await publish_to_target(first_mid=pa.first_mid, user_id=pa.user_id, items=pa.items, caption=caption)
+        lst = _get_pending_list(chat_id)
+        if pa in lst:
+            lst.remove(pa)
+    pa.expire_task = asyncio.create_task(_expire())
 
 # ====== ХЕНДЛЕРЫ ======
 @router.message(F.photo & (F.media_group_id == None))
@@ -866,11 +888,9 @@ async def handle_album_any(msg: Message):
     key = (chat_id, mgid)
 
     if msg.photo:
-        fid = msg.photo[-1].file_id
-        kind = "photo"
+        fid = msg.photo[-1].file_id; kind = "photo"
     elif msg.video:
-        fid = msg.video.file_id
-        kind = "video"
+        fid = msg.video.file_id; kind = "video"
     else:
         return
 
@@ -899,44 +919,49 @@ async def handle_album_any(msg: Message):
         caption = data["caption"]
         user_id = data["user_id"]
         first_mid = data["first_mid"]
-
         items.sort(key=lambda x: x["mid"])
-
-        if not caption:
-            if _attach_media_to_next_batch(chat_id, items, user_id):
-                return
 
         if caption:
             result = build_result_text(user_id, caption)
             if result:
                 await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption=result)
-                return
-            await publish_to_target(
-                first_mid=first_mid, user_id=user_id, items=items,
-                caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35% или 1360-20%\n\n{caption}"
-            )
+            else:
+                await publish_to_target(first_mid=first_mid, user_id=user_id, items=items,
+                                        caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35% или 1360-20%\n\n{caption}")
             return
 
-        await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption="")
+        # НОВОЕ: альбом без подписи — ставим в ожидание текста
+        pa = PendingAlbum(items=items, first_mid=first_mid, user_id=user_id)
+        _get_pending_list(chat_id).append(pa)
+        _start_expire_timer(chat_id, pa)
         return
 
     buf["task"] = asyncio.create_task(_flush_album())
 
 @router.message(F.text)
 async def handle_text(msg: Message):
-    txt = msg.text or ""
+    txt = (msg.text or "")
     has_price_token = bool(re.search(r"\d+(?:[.,]\d{3})*\s*€", txt, flags=re.I))
     has_discount    = bool(re.search(r"[–—\-−]?\s*\d{1,2}\s?%", txt))
     has_pair        = bool(PRICE_DISCOUNT_RE.search(txt))
-    has_price = has_pair or has_price_token or has_discount
 
     has_custom = any(e.type == MessageEntityType.CUSTOM_EMOJI for e in (msg.entities or []))
     is_forward = bool(getattr(msg, "forward_origin", None))
     chat_id = msg.chat.id
 
-    if not has_price and is_forward:
+    # 1) Если есть ожидающие альбомы — привяжем текст к ближайшему предыдущему
+    pend = _get_pending_list(chat_id)
+    eligible = [pa for pa in pend if pa.first_mid <= msg.message_id]
+    if eligible:
+        target = sorted(eligible, key=lambda p: msg.message_id - p.first_mid)[0]
+        # аккумулируем подпись
+        if target.caption_accum:
+            target.caption_accum += "\n"
+        target.caption_accum += txt.strip()
+        _start_flush_timer(chat_id, target)  # перезапускаем короткий таймер склейки
         return
 
+    # 2) Парные “текст-эмодзи → медиа”
     if not has_pair and not has_price_token and has_custom and not is_forward and is_admin(msg.from_user.id):
         q = _get_q(chat_id)
         rec = BatchRec(text_msg=msg, user_id=msg.from_user.id)
@@ -944,13 +969,14 @@ async def handle_text(msg: Message):
         _arm_batch_timer(chat_id, rec)
         return
 
+    # 3) Привязка к одиночному медиа (не альбом)
     bucket = last_media.get(chat_id)
     if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
         user_id = bucket.get("user_id") or msg.from_user.id
         raw_text = (bucket.get("caption") or "")
         if raw_text:
             raw_text += "\n"
-        raw_text += (msg.text or "")
+        raw_text += txt
 
         result = build_result_text(user_id, raw_text)
         items: List[Dict[str, Any]] = bucket.get("items") or []
@@ -959,47 +985,39 @@ async def handle_text(msg: Message):
         if result:
             await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption=result)
         else:
-            await publish_to_target(
-                first_mid=first_mid, user_id=user_id, items=items,
-                caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35% или 1360-20%\n\n{msg.text}"
-            )
-
+            await publish_to_target(first_mid=first_mid, user_id=user_id, items=items,
+                                    caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35% или 1360-20%\n\n{txt}")
         del last_media[chat_id]
         return
 
+    # 4) Привязка текста к самому свежему альбому (старый механизм, если вдруг не попал в pending)
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
         cand.sort(key=lambda kv: last_mid(kv[1]))
-        eligible = [kv for kv in cand if last_mid(kv[1]) <= msg.message_id]
-        key, data = (eligible[-1] if eligible else cand[-1])
+        eligible2 = [kv for kv in cand if last_mid(kv[1]) <= msg.message_id]
+        key, data = (eligible2[-1] if eligible2 else cand[-1])
 
         items: List[Dict[str, Any]] = data["items"]
         caption = (data.get("caption") or "")
         if caption:
             caption += "\n"
-        caption += (msg.text or "")
-
+        caption += txt
         items.sort(key=lambda x: x["mid"])
-
         user_id = data.get("user_id") or msg.from_user.id
         first_mid = data.get("first_mid", items[0]["mid"] if items else msg.message_id)
         result = build_result_text(user_id, caption)
-
-        if data.get("task"):
-            data["task"].cancel()
+        if data.get("task"): data["task"].cancel()
         album_buffers.pop(key, None)
-
         if result:
             await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption=result)
         else:
-            await publish_to_target(
-                first_mid=first_mid, user_id=user_id, items=items,
-                caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35% или 1360-20%\n\n{msg.text}"
-            )
+            await publish_to_target(first_mid=first_mid, user_id=user_id, items=items,
+                                    caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35% или 1360-20%\n\n{txt}")
         return
 
-    if not has_price and not has_custom:
+    # 5) Чистый текст — публикуем как есть
+    if not (has_pair or has_price_token or has_discount) and not has_custom:
         text_item = [{"kind": "text", "fid": "", "mid": msg.message_id, "cap": True}]
         await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=text_item, caption=txt)
         return
