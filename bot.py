@@ -51,20 +51,7 @@ dp.include_router(router)
 
 # ====== ПАМЯТЬ ======
 # MediaItem: {"kind": "photo"|"video"|"text"|"forward", "fid": str, "mid": int, "cap": bool}
-
-# --- РАНЬШЕ: тут была одна запись на чат (ломало «сингл -> текст -> сингл -> текст»)
-# Теперь — очередь «ожидающих» одиночных медиа по чату.
-@dataclass
-class SingleBucket:
-    ts: datetime
-    items: List[Dict[str, Any]]
-    caption: str
-    user_id: int
-    first_mid: int
-
-# очередь синглов на чат (FIFO, но выбирать будем «ближайший предыдущий» по mid)
-single_wait: Dict[int, List[SingleBucket]] = {}
-
+last_media: Dict[int, Dict[str, Any]] = {}
 active_mode: Dict[int, str] = {}
 album_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}
 
@@ -256,8 +243,8 @@ if OCR_ENABLED:
 
 _PRICE_TOKEN_RE = re.compile(
     r"""(?xi)
-    (?:[€]\s*\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?     # € слева
-     | \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*[€]     # € справа
+    (?:[€]\s*\d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?    # € слева
+     | \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*[€]    # € справа
      | \d{1,6}(?:[.,]\d{3})*(?:[.,]\d{1,2})?\s*(?:eur|euro)
     )
     """
@@ -350,7 +337,6 @@ async def ocr_should_hide(file_id: str) -> bool:
         return False
 
 async def filter_pricetag_media(items: List[Dict[str, Any]], album_ocr_on: bool) -> List[Dict[str, Any]]:
-    # Одиночные: ничего не удаляем. Альбомы: при album_ocr_on=True — вырезаем кадры-ценники (видео не режем).
     if len(items) == 1 or not album_ocr_on:
         return items
     kept: List[Dict[str, Any]] = []
@@ -637,7 +623,7 @@ def parse_input(raw_text: str) -> Dict[str, Optional[str]]:
         "cleaned_text": text,
     }
 
-# ----------- разрезатель блоков -----------
+# ----------- ВАЖНО: исправленный разрезатель блоков -----------
 def _split_by_price_lines(caption: str) -> List[str]:
     rows = (caption or "").splitlines()
     blocks: List[List[str]] = []
@@ -647,6 +633,7 @@ def _split_by_price_lines(caption: str) -> List[str]:
     def flush():
         nonlocal cur, saw_price_in_cur
         if cur and saw_price_in_cur:
+            # обрежем хвостовые пустые строки, чтобы не было большого отступа
             while cur and not cur[-1].strip():
                 cur.pop()
             if cur:
@@ -655,11 +642,14 @@ def _split_by_price_lines(caption: str) -> List[str]:
         saw_price_in_cur = False
 
     for r in rows:
+        # если пришла новая ценовая строка, а в текущем блоке уже была цена — закрываем текущий блок
         if _is_price_line(r) and saw_price_in_cur:
             flush()
         cur.append(r)
         if _is_price_line(r):
             saw_price_in_cur = True
+
+    # финальный сброс
     flush()
     return ["\n".join(b).strip() for b in blocks if b]
 
@@ -700,6 +690,7 @@ def build_result_text_multi(user_id: int, caption: str) -> Optional[str]:
     if not blocks:
         return None
     chunks = [build_result_text_for_block(user_id, b) for b in blocks]
+    # один пустой перевод между позициями
     return ("\n".join(chunks)).strip()
 
 # ====== КОМАНДЫ ======
@@ -733,8 +724,8 @@ def mk_mode(label: str,
 
 MODES: Dict[str, Dict] = {
     "sale": mk_mode("SALE"),
-    "lux": mk_mode("LUX", calc=lux_calc),          # OCR off
-    "luxocr": mk_mode("LUX OCR", calc=lux_calc),   # OCR on
+    "lux": mk_mode("LUX", calc=lux_calc),
+    "luxocr": mk_mode("LUX OCR", calc=lux_calc),
     "outlet": mk_mode("OUTLET"),
     "stock": mk_mode("STOCK"),
     "newfw": mk_mode("NEW FW"),
@@ -768,38 +759,67 @@ MODES: Dict[str, Dict] = {
 def is_admin(user_id: int) -> bool:
     return (not ADMINS) or (user_id in ADMINS)
 
-# ====== ХЕЛПЕРЫ ======
+@router.message(Command(commands=list(MODES.keys())))
+async def set_mode(msg: Message):
+    user_id = msg.from_user.id
+    cmd = msg.text.lstrip("/").split()[0]
+    if not is_admin(user_id):
+        return await msg.answer("⛔ Только для админов.")
+    active_mode[user_id] = cmd
+    await msg.answer(f"✅ Режим <b>{MODES[cmd]['label']}</b> активирован.")
 
-def _purge_expired_single(chat_id: int):
-    """Удаляем просроченные одиночные медиа, чтобы не копились."""
-    arr = single_wait.get(chat_id, [])
-    now = datetime.now()
-    keep = [b for b in arr if (now - b.ts) <= timedelta(seconds=ALBUM_WINDOW_SECONDS)]
-    if keep:
-        single_wait[chat_id] = keep
-    elif chat_id in single_wait:
-        del single_wait[chat_id]
+@router.message(Command("mode"))
+async def show_mode(msg: Message):
+    user_id = msg.from_user.id
+    mode_key = active_mode.get(user_id, "sale")
+    label = MODES.get(mode_key, MODES["sale"])["label"]
+    ocr_state = "ON" if is_ocr_enabled_for(user_id) else "OFF"
+    await msg.answer(f"Текущий режим: <b>{label}</b>\nOCR в альбомах: <b>{ocr_state}</b>")
 
-async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[str, Any]], first_mid: int, caption: str = ""):
-    # Пушим в очередь ожидания
-    _purge_expired_single(chat_id)
-    arr = single_wait.setdefault(chat_id, [])
-    arr.append(SingleBucket(ts=datetime.now(), items=items, caption=caption or "", user_id=user_id, first_mid=first_mid))
+@router.message(Command("help"))
+async def show_help(msg: Message):
+    await msg.answer(
+        "Бот принимает фото/видео (альбомы) и текст с ценой.\n"
+        "• /lux — OCR выключен, /luxocr — OCR включен.\n"
+        "• Формула: ≤250€ +55€; 251–400€ +70€; >400€ → +10% и +30€. Всё округляем вверх.\n"
+        "• Альбом без подписи публикуется сразу.\n"
+        "• /mode — показать текущий режим и состояние OCR."
+    )
 
-def _pick_best_single_for_text(chat_id: int, text_mid: int) -> Optional[SingleBucket]:
-    """Берём ближайший предыдущий сингл (first_mid <= text_mid)."""
-    _purge_expired_single(chat_id)
-    arr = single_wait.get(chat_id, [])
-    if not arr:
+@router.message(Command("ping"))
+async def ping(msg: Message):
+    await msg.answer("pong")
+
+# ====== СБОРКА ПОДПИСИ ======
+def build_result_text(user_id: int, caption: str) -> Optional[str]:
+    multi = build_result_text_multi(user_id, caption)
+    if multi:
+        return multi
+
+    data = parse_input(caption)
+    price = data.get("price")
+    if price is None:
         return None
-    # кандидаты — все, чей first_mid <= text_mid
-    cand = [b for b in arr if b.first_mid <= text_mid]
-    bucket = cand[-1] if cand else arr[0]  # если нет предыдущих — возьмём самый ранний
-    # удаляем выбранный из очереди
-    arr.remove(bucket)
-    if not arr:
-        single_wait.pop(chat_id, None)
-    return bucket
+    mode = MODES.get(active_mode.get(user_id, "sale"), MODES["sale"])
+    calc_fn, tpl_fn, _label = mode["calc"], mode["template"], mode["label"]
+    final_price = calc_fn(float(price), int(data.get("discount", 0)))
+    return tpl_fn(
+        final_price=final_price,
+        retail=float(data.get("retail", 0.0) or 0.0),
+        sizes_line=data.get("sizes_line", "") or "",
+        season_line=data.get("season_line", "") or "",
+        brand_line="",
+    )
+
+# ====== ХЕЛПЕРЫ ======
+async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[str, Any]], first_mid: int, caption: str = ""):
+    last_media[chat_id] = {
+        "ts": datetime.now(),
+        "items": items,
+        "caption": caption or "",
+        "user_id": user_id,
+        "first_mid": first_mid,
+    }
 
 # ====== ХЕНДЛЕРЫ ======
 @router.message(F.photo & (F.media_group_id == None))
@@ -815,8 +835,6 @@ async def handle_single_photo(msg: Message):
         if result:
             await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=[item], caption=result)
             return
-
-    # Сохраняем как «ожидающий» СИНГЛ (не перетирая предыдущие)
     await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], first_mid=msg.message_id, caption=caption)
     try:
         await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35% или 1360-20%) — опубликую одним постом.")
@@ -836,7 +854,6 @@ async def handle_single_video(msg: Message):
         if result:
             await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=[item], caption=result)
             return
-
     await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], first_mid=msg.message_id, caption=caption)
     try:
         await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35% или 1360-20%) — опубликую одним постом.")
@@ -885,7 +902,6 @@ async def handle_album_any(msg: Message):
 
         items.sort(key=lambda x: x["mid"])
 
-        # Если у альбома нет ценовой подписи — попробуем прикрепить к ожидающей «текст->медиа» партии
         if not caption:
             if _attach_media_to_next_batch(chat_id, items, user_id):
                 return
@@ -928,18 +944,17 @@ async def handle_text(msg: Message):
         _arm_batch_timer(chat_id, rec)
         return
 
-    # --- НОВОЕ: привязка к БЛИЖАЙШЕМУ ПРЕДЫДУЩЕМУ одиночному медиа ---
-    bucket = _pick_best_single_for_text(chat_id, msg.message_id)
-    if bucket:
-        user_id = bucket.user_id or msg.from_user.id
-        raw_text = (bucket.caption or "")
+    bucket = last_media.get(chat_id)
+    if bucket and (datetime.now() - bucket["ts"] <= timedelta(seconds=ALBUM_WINDOW_SECONDS)):
+        user_id = bucket.get("user_id") or msg.from_user.id
+        raw_text = (bucket.get("caption") or "")
         if raw_text:
             raw_text += "\n"
         raw_text += (msg.text or "")
 
         result = build_result_text(user_id, raw_text)
-        items: List[Dict[str, Any]] = bucket.items or []
-        first_mid = bucket.first_mid or (min(it["mid"] for it in items) if items else msg.message_id)
+        items: List[Dict[str, Any]] = bucket.get("items") or []
+        first_mid = bucket.get("first_mid") or (min(it["mid"] for it in items) if items else msg.message_id)
 
         if result:
             await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption=result)
@@ -948,9 +963,10 @@ async def handle_text(msg: Message):
                 first_mid=first_mid, user_id=user_id, items=items,
                 caption=f"⚠️ Не нашла цену в тексте. Пример: 650€ -35% или 1360-20%\n\n{msg.text}"
             )
+
+        del last_media[chat_id]
         return
 
-    # --- Привязка текста к самому свежему альбому этого чата (если ещё «дышит») ---
     cand = [(k, v) for (k, v) in album_buffers.items() if k[0] == chat_id and v.get("items")]
     if cand:
         def last_mid(buf): return max(it["mid"] for it in buf["items"])
@@ -983,7 +999,6 @@ async def handle_text(msg: Message):
             )
         return
 
-    # Чистые тексты без цены и без custom_emoji — отправляем как текст
     if not has_price and not has_custom:
         text_item = [{"kind": "text", "fid": "", "mid": msg.message_id, "cap": True}]
         await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=text_item, caption=txt)
