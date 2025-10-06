@@ -821,9 +821,27 @@ async def _remember_media_for_text(chat_id: int, user_id: int, items: List[Dict[
         "first_mid": first_mid,
     }
 
+# >>> NEW: принудительный флаш предыдущего одиночного медиа перед новым
+async def _flush_pending_single_media(chat_id: int):
+    bucket = last_media.get(chat_id)
+    if not bucket:
+        return
+    items: List[Dict[str, Any]] = bucket.get("items") or []
+    if not items:
+        last_media.pop(chat_id, None)
+        return
+    first_mid = bucket.get("first_mid") or min(it["mid"] for it in items)
+    user_id = bucket.get("user_id") or 0
+    # Публикуем как есть, без подсказок
+    await publish_to_target(first_mid=first_mid, user_id=user_id, items=items, caption="")
+    last_media.pop(chat_id, None)
+
 # ====== ХЕНДЛЕРЫ ======
 @router.message(F.photo & (F.media_group_id == None))
 async def handle_single_photo(msg: Message):
+    # Флашим то, что "ждало" текста, прежде чем принимать новый единичный кадр
+    await _flush_pending_single_media(msg.chat.id)
+
     item = {"kind": "photo", "fid": msg.photo[-1].file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
 
@@ -836,13 +854,13 @@ async def handle_single_photo(msg: Message):
             await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=[item], caption=result)
             return
     await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], first_mid=msg.message_id, caption=caption)
-    try:
-        await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35% или 1360-20%) — опубликую одним постом.")
-    except Exception:
-        pass
+    # (подсказку про «Добавь текст…» больше не отправляем)
 
 @router.message(F.video & (F.media_group_id == None))
 async def handle_single_video(msg: Message):
+    # Флашим то, что "ждало" текста, прежде чем принимать новый единичный кадр
+    await _flush_pending_single_media(msg.chat.id)
+
     item = {"kind": "video", "fid": msg.video.file_id, "mid": msg.message_id, "cap": bool(msg.caption)}
     caption = (msg.caption or "").strip()
 
@@ -855,10 +873,7 @@ async def handle_single_video(msg: Message):
             await publish_to_target(first_mid=msg.message_id, user_id=msg.from_user.id, items=[item], caption=result)
             return
     await _remember_media_for_text(msg.chat.id, msg.from_user.id, [item], first_mid=msg.message_id, caption=caption)
-    try:
-        await msg.answer("Добавь текст с ценой/скидкой (например: 650€ -35% или 1360-20%) — опубликую одним постом.")
-    except Exception:
-        pass
+    # (подсказку про «Добавь текст…» больше не отправляем)
 
 @router.message(F.media_group_id)
 async def handle_album_any(msg: Message):
